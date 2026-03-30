@@ -2,7 +2,10 @@ import logging
 import os
 import shutil
 
-PLUGIN_NAME = "astrbot_plugin_df_red"
+PLUGIN_NAME = "astrbot_plugin_deltaforce_loot_broadcast"
+LEGACY_PLUGIN_NAMES = (
+    "astrbot_plugin_df_red",
+)
 PLUGIN_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 FALLBACK_RUNTIME_DIR = os.path.join(PLUGIN_ROOT, ".runtime_data")
 
@@ -36,6 +39,16 @@ def get_runtime_data_dir():
             runtime_dir = FALLBACK_RUNTIME_DIR
     os.makedirs(runtime_dir, exist_ok=True)
     return runtime_dir
+
+
+def _get_legacy_runtime_dirs():
+    legacy_dirs = []
+    astrbot_data_dir = _find_astrbot_data_dir()
+    if astrbot_data_dir:
+        for legacy_name in LEGACY_PLUGIN_NAMES:
+            legacy_dirs.append(os.path.join(astrbot_data_dir, "plugin_data", legacy_name))
+    legacy_dirs.append(FALLBACK_RUNTIME_DIR)
+    return legacy_dirs
 
 
 def get_runtime_debug_dir():
@@ -73,4 +86,6 @@ def get_runtime_file_path(filename, legacy_relative_paths=None):
         os.path.join(PLUGIN_ROOT, relative_path)
         for relative_path in legacy_relative_paths
     ]
+    for legacy_dir in _get_legacy_runtime_dirs():
+        legacy_paths.append(os.path.join(legacy_dir, filename))
     return _copy_legacy_file_if_needed(runtime_path, legacy_paths)

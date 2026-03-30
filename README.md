@@ -1,7 +1,7 @@
-# AstrBot 三角洲物资播报插件 (astrbot_plugin_df_red)
+# AstrBot 三角洲物资播报插件 (astrbot_plugin_deltaforce_loot_broadcast)
 
 一个用于 AstrBot 的三角洲行动插件，用于监测玩家最近对局的撤离带出物品，并在命中高价值收集品时进行群播报。
-插件运行数据会优先写入 AstrBot 的 `data/plugin_data/astrbot_plugin_df_red/`，便于直接 `git pull` 后重载插件，而不必卸载重装。
+插件运行数据会优先写入 AstrBot 的 `data/plugin_data/astrbot_plugin_deltaforce_loot_broadcast/`，便于直接 `git pull` 后重载插件，而不必卸载重装。
 
 ## 功能特性
 
@@ -39,7 +39,7 @@
 
 插件会把物品列表缓存到：
 
-- AstrBot 安装环境下：`data/plugin_data/astrbot_plugin_df_red/item_catalog_cache.json`
+- AstrBot 安装环境下：`data/plugin_data/astrbot_plugin_deltaforce_loot_broadcast/item_catalog_cache.json`
 - 非 AstrBot 标准目录下：插件目录内的 `.runtime_data/item_catalog_cache.json`
 
 说明：
@@ -50,23 +50,23 @@
 
 ## 运行数据目录
 
-以下文件会优先写入 `data/plugin_data/astrbot_plugin_df_red/`：
+以下文件会优先写入 `data/plugin_data/astrbot_plugin_deltaforce_loot_broadcast/`：
 
 - `df_red_data.json`
 - `item_catalog_cache.json`
 - `debug/debug_last_report.txt`
 - `debug/debug_last_broadcast.txt`
 
-如果插件从旧版本升级，首次启动时会自动从插件目录复制旧的绑定与缓存数据到新目录。
+如果插件从旧版本升级，首次启动时会自动从旧插件名 `astrbot_plugin_df_red` 对应的数据目录迁移绑定与缓存数据。
 
 ## 更新插件
 
-推荐把插件仓库放到 AstrBot 的 `data/plugins/astrbot_plugin_df_red/` 下：
+推荐把插件仓库放到 AstrBot 的 `data/plugins/astrbot_plugin_deltaforce_loot_broadcast/` 下：
 
 1. 在插件目录执行 `git pull`
 2. 回到 AstrBot WebUI，执行“重载插件”
 
-这样代码会更新，但绑定信息、缓存和调试文件会继续保留在 `data/plugin_data/astrbot_plugin_df_red/` 中。
+这样代码会更新，但绑定信息、缓存和调试文件会继续保留在 `data/plugin_data/astrbot_plugin_deltaforce_loot_broadcast/` 中。
 
 ## 收集品判定规则
 
