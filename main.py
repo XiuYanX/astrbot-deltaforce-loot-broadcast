@@ -11,7 +11,7 @@ from .monitor.red_detector import RedDetector
 MAX_LOGIN_ATTEMPTS = 120
 LOGIN_ATTEMPT_INTERVAL = 0.5
 
-@register("astrbot_plugin_df_red", "Antigravity", "AstrBot 三角洲物资播报插件", "1.0.0")
+@register("astrbot_plugin_df_red", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.0")
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)

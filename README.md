@@ -94,4 +94,6 @@ AstrBot 相关依赖由运行环境提供。
 
 ## 开发者
 
-无赋
+XiuYan
+
+本项目基于 vibe coding 制作。

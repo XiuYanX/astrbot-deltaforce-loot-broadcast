@@ -2,5 +2,5 @@ name: astrbot_plugin_df_red
 display_name: AstrBot 三角洲物资播报
 desc: 定时查询三角洲行动战绩，并在群内播报获得的高价值物资。
 version: v1.0.0
-author: 无赋
+author: XiuYan
 repo: https://github.com/XiuYanX/astrbot-deltaforce-loot-broadcast.git
