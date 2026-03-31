@@ -62,6 +62,8 @@ if os.name == "nt":
 class SecretProtector:
     def __init__(self):
         self._fernet = None
+        self._plaintext_fallback_logged = False
+        self._legacy_plaintext_value_logged = False
 
     @staticmethod
     def _restrict_file_permissions(path):
@@ -178,6 +180,33 @@ class SecretProtector:
             del data_buffer
             del entropy_buffer
 
+    def _log_plaintext_fallback(self, reason):
+        if self._plaintext_fallback_logged:
+            return
+        logger.warning(
+            "Secret protection fallback activated; values will be stored in plaintext "
+            f"until secure storage is available: {reason}"
+        )
+        self._plaintext_fallback_logged = True
+
+    def _log_legacy_plaintext_value(self):
+        if self._legacy_plaintext_value_logged:
+            return
+        logger.warning(
+            "Detected legacy plaintext secret value; returning it as-is for migration."
+        )
+        self._legacy_plaintext_value_logged = True
+
+    def _reset_fernet_key(self, key_path, *, reason):
+        key = Fernet.generate_key()
+        self._write_bytes_atomic(key_path, key)
+        self._fernet = Fernet(key)
+        logger.warning(
+            "Reset Fernet key for secret storage at "
+            f"{key_path}: {reason}"
+        )
+        return self._fernet
+
     def _get_fernet(self):
         if self._fernet is not None:
             return self._fernet
@@ -186,14 +215,29 @@ class SecretProtector:
                 "The 'cryptography' package is required to protect secrets on non-Windows platforms."
             )
 
-        key_path = Path(get_runtime_file_path(SECRET_KEY_FILENAME))
-        if key_path.exists():
+        key_path = get_runtime_file_path(SECRET_KEY_FILENAME)
+        if not key_path.exists():
+            return self._reset_fernet_key(key_path, reason="missing key file")
+
+        try:
             key = key_path.read_bytes()
-        else:
-            key = Fernet.generate_key()
-            self._write_bytes_atomic(key_path, key)
-        self._fernet = Fernet(key)
-        return self._fernet
+            self._fernet = Fernet(key)
+            return self._fernet
+        except (OSError, TypeError, ValueError) as exc:
+            corrupt_path = key_path.with_suffix(f"{key_path.suffix}.corrupt")
+            try:
+                if corrupt_path.exists():
+                    corrupt_path.unlink()
+                key_path.replace(corrupt_path)
+            except OSError as move_exc:
+                logger.warning(
+                    "Failed to preserve invalid Fernet key before reset: "
+                    f"{type(move_exc).__name__}: {move_exc}"
+                )
+            return self._reset_fernet_key(
+                key_path,
+                reason=f"invalid key data ({type(exc).__name__}: {exc})",
+            )
 
     def protect(self, value):
         text = str(value or "")
@@ -202,10 +246,18 @@ class SecretProtector:
 
         raw_bytes = text.encode("utf-8")
         if os.name == "nt":
-            encrypted = self._protect_with_dpapi(raw_bytes)
+            try:
+                encrypted = self._protect_with_dpapi(raw_bytes)
+            except OSError as exc:
+                self._log_plaintext_fallback(f"{type(exc).__name__}: {exc}")
+                return text
             return self._build_secret_value("dpapi", self._encode_payload(encrypted))
 
-        token = self._get_fernet().encrypt(raw_bytes).decode("ascii")
+        try:
+            token = self._get_fernet().encrypt(raw_bytes).decode("ascii")
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._log_plaintext_fallback(f"{type(exc).__name__}: {exc}")
+            return text
         return self._build_secret_value("fernet", token)
 
     def unprotect(self, value):
@@ -215,7 +267,7 @@ class SecretProtector:
 
         backend, payload = self._parse_secret_value(text)
         if not backend:
-            logger.warning("Detected legacy plaintext secret value; returning it as-is for migration.")
+            self._log_legacy_plaintext_value()
             return text
 
         try:

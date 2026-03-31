@@ -32,6 +32,10 @@ class Storage:
                     f"{self.filepath}: {type(exc).__name__}: {exc}"
                 )
 
+    @staticmethod
+    def _normalize_sender_id(sender_id):
+        return str(sender_id)
+
     def _load_from_disk(self):
         data = copy.deepcopy(DEFAULT_STORAGE_DATA)
         if not os.path.exists(self.filepath):
@@ -144,17 +148,22 @@ class Storage:
                 except OSError:
                     pass
 
-    async def _persist_locked(self):
-        snapshot = copy.deepcopy(self.data)
+    async def _persist_locked(self, new_data=None):
+        snapshot_source = self.data if new_data is None else new_data
+        snapshot = copy.deepcopy(snapshot_source)
         try:
             await asyncio.to_thread(self._write_atomic_file, snapshot)
         except OSError as exc:
             logger.error(f"Failed to save storage to {self.filepath}: {type(exc).__name__}: {exc}")
             raise
+        if new_data is not None:
+            self.data = snapshot
 
     async def add_user(self, sender_id, openid, access_token, name="", platform="qq", role_id=""):
+        sender_id = self._normalize_sender_id(sender_id)
         async with self._lock:
-            users = self.data["users"]
+            new_data = copy.deepcopy(self.data)
+            users = new_data["users"]
             user_state = copy.deepcopy(users.get(sender_id, {}))
             user_state.update({
                 "name": name,
@@ -167,35 +176,40 @@ class Storage:
             })
             self._set_user_secrets(user_state, openid=openid, access_token=access_token)
             users[sender_id] = user_state
-            await self._persist_locked()
+            await self._persist_locked(new_data)
 
     async def remove_user(self, sender_id):
+        sender_id = self._normalize_sender_id(sender_id)
         async with self._lock:
             if sender_id not in self.data["users"]:
                 return False
-            del self.data["users"][sender_id]
-            await self._persist_locked()
+            new_data = copy.deepcopy(self.data)
+            del new_data["users"][sender_id]
+            await self._persist_locked(new_data)
             return True
 
     async def add_group(self, origin):
         async with self._lock:
-            groups = self.data["group_origins"]
+            new_data = copy.deepcopy(self.data)
+            groups = new_data["group_origins"]
             if origin in groups:
                 return False
             groups.append(origin)
-            await self._persist_locked()
+            await self._persist_locked(new_data)
             return True
 
     async def remove_group(self, origin):
         async with self._lock:
-            groups = self.data["group_origins"]
+            new_data = copy.deepcopy(self.data)
+            groups = new_data["group_origins"]
             if origin not in groups:
                 return False
             groups.remove(origin)
-            await self._persist_locked()
+            await self._persist_locked(new_data)
             return True
 
     async def get_user(self, sender_id):
+        sender_id = self._normalize_sender_id(sender_id)
         async with self._lock:
             user_data = self.data.get("users", {}).get(sender_id)
             if not isinstance(user_data, dict):
@@ -217,13 +231,16 @@ class Storage:
         if not fields:
             return False
 
+        sender_id = self._normalize_sender_id(sender_id)
         async with self._lock:
             user_data = self.data.get("users", {}).get(sender_id)
             if not isinstance(user_data, dict):
                 return False
+            new_data = copy.deepcopy(self.data)
+            user_data = new_data["users"].get(sender_id)
             openid = fields.pop("openid", None) if "openid" in fields else None
             access_token = fields.pop("access_token", None) if "access_token" in fields else None
             user_data.update(copy.deepcopy(fields))
             self._set_user_secrets(user_data, openid=openid, access_token=access_token)
-            await self._persist_locked()
+            await self._persist_locked(new_data)
             return True

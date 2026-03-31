@@ -1,5 +1,4 @@
 import shutil
-from functools import lru_cache
 from pathlib import Path
 
 from astrbot.api import logger
@@ -11,24 +10,51 @@ LEGACY_PLUGIN_NAMES = (
 )
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FALLBACK_RUNTIME_DIR = PLUGIN_ROOT / ".runtime_data"
+_FRAMEWORK_RUNTIME_DIR = None
+_FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED = False
 
 
-@lru_cache(maxsize=1)
-def _get_framework_runtime_dir():
-    try:
-        return StarTools.get_data_dir(PLUGIN_NAME)
-    except Exception as exc:
-        logger.warning(
-            "Failed to resolve AstrBot plugin data dir via StarTools, "
-            f"falling back to local runtime dir: {type(exc).__name__}: {exc}"
-        )
+def _coerce_path(value):
+    if value is None:
         return None
+    return Path(value).resolve()
+
+
+def _normalize_runtime_relative_path(value, *, label):
+    relative_path = Path(str(value or ""))
+    if not relative_path.parts:
+        raise ValueError(f"{label} must not be empty")
+    if relative_path.is_absolute():
+        raise ValueError(f"{label} must be a relative path")
+    if any(part in ("", ".", "..") for part in relative_path.parts):
+        raise ValueError(f"{label} must stay within the runtime directory")
+    return relative_path
+
+
+def _get_framework_runtime_dir():
+    global _FRAMEWORK_RUNTIME_DIR, _FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED
+    if _FRAMEWORK_RUNTIME_DIR is not None:
+        return _FRAMEWORK_RUNTIME_DIR
+    try:
+        runtime_dir = _coerce_path(StarTools.get_data_dir(PLUGIN_NAME))
+    except Exception as exc:
+        if not _FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED:
+            logger.warning(
+                "Failed to resolve AstrBot plugin data dir via StarTools, "
+                f"falling back to local runtime dir: {type(exc).__name__}: {exc}"
+            )
+            _FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED = True
+        return None
+    if runtime_dir is not None:
+        _FRAMEWORK_RUNTIME_DIR = runtime_dir
+        _FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED = False
+    return runtime_dir
 
 
 def get_runtime_data_dir():
     runtime_dir = _get_framework_runtime_dir() or FALLBACK_RUNTIME_DIR
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    return str(runtime_dir.resolve())
+    return runtime_dir.resolve()
 
 
 def _get_legacy_runtime_dirs():
@@ -52,13 +78,13 @@ def _get_legacy_runtime_dirs():
 
 
 def get_runtime_debug_dir():
-    debug_dir = Path(get_runtime_data_dir()) / "debug"
+    debug_dir = get_runtime_data_dir() / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
-    return str(debug_dir.resolve())
+    return debug_dir.resolve()
 
 
 def get_plugin_root():
-    return str(PLUGIN_ROOT)
+    return PLUGIN_ROOT
 
 
 def _copy_legacy_file_if_needed(target_path, legacy_paths):
@@ -84,12 +110,21 @@ def _copy_legacy_file_if_needed(target_path, legacy_paths):
 
 
 def get_runtime_file_path(filename, legacy_relative_paths=None):
-    runtime_path = Path(get_runtime_data_dir()) / filename
-    legacy_relative_paths = legacy_relative_paths or [filename]
-    legacy_paths = [
-        PLUGIN_ROOT / relative_path
+    runtime_relative_path = _normalize_runtime_relative_path(
+        filename,
+        label="filename",
+    )
+    runtime_path = get_runtime_data_dir() / runtime_relative_path
+    legacy_relative_paths = legacy_relative_paths or [runtime_relative_path]
+    normalized_legacy_paths = [
+        _normalize_runtime_relative_path(relative_path, label="legacy_relative_paths item")
         for relative_path in legacy_relative_paths
     ]
+    legacy_paths = [
+        PLUGIN_ROOT / relative_path
+        for relative_path in normalized_legacy_paths
+    ]
     for legacy_dir in _get_legacy_runtime_dirs():
-        legacy_paths.append(legacy_dir / filename)
-    return str(_copy_legacy_file_if_needed(runtime_path, legacy_paths))
+        for relative_path in normalized_legacy_paths:
+            legacy_paths.append(legacy_dir / relative_path)
+    return _copy_legacy_file_if_needed(runtime_path, legacy_paths)

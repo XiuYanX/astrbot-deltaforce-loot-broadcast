@@ -14,7 +14,7 @@ from .monitor.red_detector import RedDetector
 MAX_LOGIN_ATTEMPTS = 120
 LOGIN_ATTEMPT_INTERVAL = 0.5
 
-@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.0")
+@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.1")
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -22,6 +22,12 @@ class DeltaForceRedPlugin(Star):
         self.command_api = GameAPI("qq")
         self.storage = Storage()
         self.detector = RedDetector(self.storage, context)
+
+    def _log_command_exception(self, command_name: str, sender_id, exc: Exception):
+        logger.error(
+            f"Command {command_name} failed for sender {sender_id}: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
     async def _finish_bind(self, sender_id: str, user_name: str, platform: str, openid: str, access_token: str):
         bind_res = await self.command_api.bind_account(access_token, openid, platform)
@@ -91,6 +97,9 @@ class DeltaForceRedPlugin(Star):
         """异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
         logger.info("AstrBot 三角洲物资播报插件初始化...")
         logger.info(f"AstrBot 三角洲物资播报运行数据目录: {get_runtime_data_dir()}")
+        if self.polling_task and not self.polling_task.done():
+            logger.warning("Polling task is already running; skipping duplicate initialization.")
+            return
         self.polling_task = asyncio.create_task(self.start_polling())
 
     async def start_polling(self):
@@ -119,8 +128,9 @@ class DeltaForceRedPlugin(Star):
     @filter.command("df解绑")
     async def unbind_account(self, event: AstrMessageEvent):
         """解除绑定三角洲游戏账号"""
-        sender_id = event.get_sender_id()
+        sender_id = str(event.get_sender_id())
         await self.storage.remove_user(sender_id)
+        self.detector.clear_user_runtime_state(sender_id)
         yield event.plain_result("解绑成功！已停止您的大红物品监测。")
 
     @filter.command("df设置群")
@@ -145,7 +155,7 @@ class DeltaForceRedPlugin(Star):
         """查看当前绑定状态与播报群状态"""
         users = await self.storage.get_users()
         groups = await self.storage.get_groups()
-        sender_id = event.get_sender_id()
+        sender_id = str(event.get_sender_id())
         
         bind_status = "已绑定" if sender_id in users else "未绑定"
         group_counts = len(groups)
@@ -261,7 +271,8 @@ class DeltaForceRedPlugin(Star):
                 yield event.plain_result(f"最近一局（{dt}）检测到以下带出收集品：\n{items_str}")
             
         except Exception as e:
-            yield event.plain_result(f"❌ 探测过程中异常：{str(e)}")
+            self._log_command_exception("df检查", sender_id, e)
+            yield event.plain_result("❌ 探测失败，请稍后重试。若问题持续，请查看日志。")
 
     @filter.command("df检查详细")
     async def check_debug(self, event: AstrMessageEvent):
@@ -346,7 +357,8 @@ class DeltaForceRedPlugin(Star):
                 f"报告路径：{path}"
             )
         except Exception as e:
-            yield event.plain_result(f"❌ 详细调试异常：{str(e)}")
+            self._log_command_exception("df检查详细", sender_id, e)
+            yield event.plain_result("❌ 详细调试失败，请稍后重试或查看日志。")
 
     async def terminate(self):
         """插件销毁方法，当插件被卸载/停用时会调用。"""

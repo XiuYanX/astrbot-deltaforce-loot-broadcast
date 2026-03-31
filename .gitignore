@@ -6,3 +6,4 @@ df_red_data.json
 item_catalog_cache.json
 debug_last_report.txt
 debug_last_broadcast.txt
+tests/.tmp/

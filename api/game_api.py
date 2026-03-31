@@ -6,7 +6,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 from astrbot.api import logger
@@ -61,7 +61,7 @@ class GameAPI:
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession(
                     timeout=self.timeout,
-                    cookie_jar=aiohttp.DummyCookieJar(),
+                    cookie_jar=aiohttp.CookieJar(),
                 )
             return self._session
 
@@ -136,11 +136,28 @@ class GameAPI:
 
     @classmethod
     def _snapshot_response(cls, response):
-        return {
+        snapshot = {
             "status": response.status,
             "headers": dict(response.headers),
             "cookies": cls._collect_response_cookies(response),
         }
+        try:
+            session_cookies = response._session.cookie_jar.filter_cookies(response.url)
+            for key, morsel in session_cookies.items():
+                snapshot["cookies"][str(key)] = str(morsel.value)
+        except Exception:
+            pass
+        return snapshot
+
+    @staticmethod
+    def _extract_query_param(url, name):
+        if not url:
+            return ""
+        try:
+            values = parse_qs(urlparse(url).query, keep_blank_values=True).get(name, [])
+        except ValueError:
+            return ""
+        return values[0] if values else ""
 
     @staticmethod
     def _restrict_file_permissions(path):
@@ -491,8 +508,8 @@ class GameAPI:
             return {"status": False, "message": "获取access token失败", "data": {}}
 
         location = response["headers"].get("Location", "")
-        code_match = re.search(r"code=(.*?)&", location)
-        if not code_match:
+        auth_code = self._extract_query_param(location, "code")
+        if not auth_code:
             return {"status": False, "message": "Cookie过期，请重新扫码登录", "data": {}}
 
         merged_cookies = self._merge_cookies(cookies, response["cookies"])
@@ -510,7 +527,7 @@ class GameAPI:
         merged_cookies = self._merge_cookies(merged_cookies, redirect_response["cookies"])
         params = {
             "a": "qcCodeToOpenId",
-            "qc_code": code_match.group(1),
+            "qc_code": auth_code,
             "appid": APPID,
             "redirect_uri": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html",
             "callback": "miloJsonpCb_86690",
