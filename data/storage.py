@@ -7,7 +7,7 @@ import tempfile
 from astrbot.api import logger
 
 from .runtime_paths import get_runtime_file_path
-from .secret_store import SecretProtectionError, SecretProtector
+from .secret_store import SecretDecryptionError, SecretProtectionError, SecretProtector
 
 DEFAULT_STORAGE_DATA = {
     "group_origins": [],
@@ -22,6 +22,7 @@ class Storage:
         self.filepath = os.path.abspath(filepath)
         self._lock = asyncio.Lock()
         self.secret_protector = SecretProtector()
+        self._logged_secret_failures = set()
         self.data, needs_migration = self._load_from_disk()
         if needs_migration:
             try:
@@ -114,12 +115,38 @@ class Storage:
 
         return normalized, migrated
 
-    def _hydrate_user_record(self, user_data):
+    def _log_secret_hydration_failure(self, sender_id, field_name, exc):
+        failure_key = (str(sender_id), str(field_name))
+        if failure_key in self._logged_secret_failures:
+            return
+        logger.warning(
+            f"Failed to decrypt persisted {field_name} for sender {sender_id} "
+            f"in {self.filepath}: {exc}"
+        )
+        self._logged_secret_failures.add(failure_key)
+
+    def _hydrate_user_record(self, user_data, *, sender_id="<unknown>"):
         hydrated = copy.deepcopy(user_data)
-        if "openid_secret" in hydrated:
-            hydrated["openid"] = self.secret_protector.unprotect(hydrated.get("openid_secret", ""))
-        if "access_token_secret" in hydrated:
-            hydrated["access_token"] = self.secret_protector.unprotect(hydrated.get("access_token_secret", ""))
+        secret_errors = {}
+        for secret_field, plain_field in (
+            ("openid_secret", "openid"),
+            ("access_token_secret", "access_token"),
+        ):
+            if secret_field not in hydrated:
+                continue
+            try:
+                hydrated[plain_field] = self.secret_protector.unprotect(
+                    hydrated.get(secret_field, "")
+                )
+                self._logged_secret_failures.discard((str(sender_id), plain_field))
+            except SecretDecryptionError as exc:
+                hydrated.pop(plain_field, None)
+                secret_errors[plain_field] = str(exc)
+                self._log_secret_hydration_failure(sender_id, plain_field, exc)
+        if secret_errors:
+            hydrated["_secret_errors"] = secret_errors
+        else:
+            hydrated.pop("_secret_errors", None)
         return hydrated
 
     def _set_user_secrets(self, user_state, openid=None, access_token=None):
@@ -194,17 +221,18 @@ class Storage:
         async with self._lock:
             new_data = copy.deepcopy(self.data)
             users = new_data["users"]
-            user_state = copy.deepcopy(users.get(sender_id, {}))
-            user_state.update({
+            # Rebinding replaces the account for this sender, so account-specific
+            # runtime state must start from a clean baseline.
+            user_state = {
                 "name": name,
                 "platform": platform,
-                "role_id": role_id or user_state.get("role_id", ""),
-                "last_match_time": user_state.get("last_match_time", ""),
-                "last_room_id": user_state.get("last_room_id", ""),
-                "last_item_flow_keys": list(user_state.get("last_item_flow_keys", [])),
-                "pending_broadcasts": list(user_state.get("pending_broadcasts", [])),
-                "assets": list(user_state.get("assets", [])),
-            })
+                "role_id": role_id,
+                "last_match_time": "",
+                "last_room_id": "",
+                "last_item_flow_keys": [],
+                "pending_broadcasts": [],
+                "assets": [],
+            }
             self._set_user_secrets(user_state, openid=openid, access_token=access_token)
             users[sender_id] = user_state
             await self._persist_locked(new_data)
@@ -251,12 +279,12 @@ class Storage:
             user_data = self.data.get("users", {}).get(sender_id)
             if not isinstance(user_data, dict):
                 return None
-            return self._hydrate_user_record(user_data)
+            return self._hydrate_user_record(user_data, sender_id=sender_id)
 
     async def get_users(self):
         async with self._lock:
             return {
-                sender_id: self._hydrate_user_record(user_data)
+                sender_id: self._hydrate_user_record(user_data, sender_id=sender_id)
                 for sender_id, user_data in self.data.get("users", {}).items()
             }
 

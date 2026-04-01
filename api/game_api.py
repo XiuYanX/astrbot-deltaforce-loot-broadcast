@@ -7,7 +7,7 @@ import tempfile
 import time
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import aiohttp
 from astrbot.api import logger
@@ -41,8 +41,8 @@ REQUEST_EXCEPTIONS = (
     asyncio.TimeoutError,
     aiohttp.ContentTypeError,
     json.JSONDecodeError,
-    ValueError,
 )
+REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 ALLOWED_REDIRECT_HOSTS = frozenset(
     {
         "graph.qq.com",
@@ -221,6 +221,13 @@ class GameAPI:
         return values[0] if values else ""
 
     @staticmethod
+    def _resolve_redirect_url(base_url, location):
+        location_text = str(location or "").strip()
+        if not location_text:
+            return ""
+        return urljoin(str(base_url or ""), location_text)
+
+    @staticmethod
     def _restrict_file_permissions(path):
         try:
             os.chmod(path, 0o600)
@@ -258,6 +265,49 @@ class GameAPI:
         except REQUEST_EXCEPTIONS as exc:
             logger.warning(f"{error_context}: {type(exc).__name__}: {exc}")
             raise
+
+    async def _request_get_with_allowed_redirects(
+        self,
+        url,
+        *,
+        error_context,
+        cookies=None,
+        max_redirects=5,
+        **kwargs,
+    ):
+        current_url = str(url or "")
+        current_cookies = self._parse_cookies(cookies)
+        response_snapshot = None
+        response_text = ""
+
+        for _ in range(max_redirects + 1):
+            response_snapshot, response_text = await self._request_text(
+                "GET",
+                current_url,
+                headers=kwargs.get("headers"),
+                params=kwargs.get("params"),
+                cookies=current_cookies,
+                allow_redirects=False,
+                error_context=error_context,
+            )
+            current_cookies = self._merge_cookies(current_cookies, response_snapshot["cookies"])
+            location = response_snapshot["headers"].get("Location", "")
+            if response_snapshot["status"] not in REDIRECT_STATUS_CODES or not location:
+                response_snapshot["cookies"] = current_cookies
+                return response_snapshot, response_text
+
+            next_url = self._resolve_redirect_url(current_url, location)
+            if not self._is_allowed_redirect_target(next_url):
+                logger.warning(
+                    "Rejected unexpected redirect target while following QQ login redirect chain: "
+                    f"{next_url}"
+                )
+                raise aiohttp.ClientError(f"Blocked redirect target: {next_url}")
+            current_url = next_url
+
+        raise aiohttp.ClientError(
+            f"Exceeded {max_redirects} redirects while requesting {url}"
+        )
 
     async def _request_json(self, method, url, *, error_context, **kwargs):
         session = await self._get_session()
@@ -520,8 +570,7 @@ class GameAPI:
             )
             return {"code": -4, "message": "获取登录状态失败", "data": {}}
         try:
-            redirect_response, _ = await self._request_text(
-                "GET",
+            redirect_response, _ = await self._request_get_with_allowed_redirects(
                 redirect_url,
                 headers=self._get_headers(),
                 cookies=merged_cookies,
@@ -585,8 +634,7 @@ class GameAPI:
 
         merged_cookies = self._merge_cookies(cookies, response["cookies"])
         try:
-            redirect_response, _ = await self._request_text(
-                "GET",
+            redirect_response, _ = await self._request_get_with_allowed_redirects(
                 location,
                 headers=headers,
                 cookies=merged_cookies,
@@ -999,16 +1047,7 @@ class GameAPI:
             return result.get("jData", {}).get("data", {}).get("data", {}).get("list", [])
         return []
 
-    async def fetch_item_catalog(self, openid, access_token, force_refresh=False, platform=None):
-        """
-        获取并缓存物品列表。
-        物品信息相对稳定，默认优先读取本地缓存。
-        """
-        if not force_refresh:
-            cached = self._load_item_catalog_cache()
-            if cached:
-                return cached.get("items", [])
-
+    async def _fetch_item_catalog_from_remote(self, openid, access_token, platform=None):
         cookies = self.create_cookie(openid, access_token, platform=platform)
         data = dict(OBJECT_LIST_PARAMS)
         data["param"] = json.dumps({"primary": "props", "objectID": ""}, ensure_ascii=False)
@@ -1020,13 +1059,59 @@ class GameAPI:
                 error_context="Failed to fetch item catalog",
             )
         except REQUEST_EXCEPTIONS:
-            result = {}
+            return None
 
-        if result.get("ret") == 0:
-            items = result.get("jData", {}).get("data", {}).get("data", {}).get("list", [])
-            if isinstance(items, list):
-                self._save_item_catalog_cache(items)
-                return items
+        if result.get("ret") != 0:
+            return None
+        items = result.get("jData", {}).get("data", {}).get("data", {}).get("list", [])
+        if not isinstance(items, list):
+            return None
+        self._save_item_catalog_cache(items)
+        return items
+
+    async def refresh_item_catalog(self, openid, access_token, platform=None):
+        items = await self._fetch_item_catalog_from_remote(
+            openid,
+            access_token,
+            platform=platform,
+        )
+        if items is not None:
+            return {
+                "status": True,
+                "items": items,
+                "source": "network",
+            }
+
+        cached = self._load_item_catalog_cache()
+        if cached:
+            return {
+                "status": False,
+                "items": cached.get("items", []),
+                "source": "cache",
+            }
+        return {
+            "status": False,
+            "items": [],
+            "source": "none",
+        }
+
+    async def fetch_item_catalog(self, openid, access_token, force_refresh=False, platform=None):
+        """
+        获取并缓存物品列表。
+        物品信息相对稳定，默认优先读取本地缓存。
+        """
+        if not force_refresh:
+            cached = self._load_item_catalog_cache()
+            if cached:
+                return cached.get("items", [])
+
+        items = await self._fetch_item_catalog_from_remote(
+            openid,
+            access_token,
+            platform=platform,
+        )
+        if items is not None:
+            return items
 
         cached = self._load_item_catalog_cache()
         if cached:

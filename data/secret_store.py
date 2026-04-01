@@ -25,6 +25,10 @@ class SecretProtectionError(RuntimeError):
     pass
 
 
+class SecretDecryptionError(RuntimeError):
+    pass
+
+
 if os.name == "nt":
     import ctypes
     from ctypes import wintypes
@@ -283,8 +287,11 @@ class SecretProtector:
                 decrypted = self._get_fernet().decrypt(payload.encode("ascii"))
                 return decrypted.decode("utf-8")
         except (InvalidToken, OSError, ValueError, RuntimeError) as exc:
-            logger.warning(f"Failed to decrypt protected secret with backend {backend}: {type(exc).__name__}: {exc}")
-            return ""
+            raise SecretDecryptionError(
+                f"Failed to decrypt protected secret with backend {backend}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
-        logger.warning(f"Unsupported secret backend '{backend}', ignoring protected value.")
-        return ""
+        raise SecretDecryptionError(
+            f"Unsupported secret backend '{backend}' for protected secret value."
+        )

@@ -5,17 +5,18 @@
 
 ## 版本信息
 
-- 当前版本：`v1.0.3`
-- 发布日期：`2026-03-31`
+- 当前版本：`v1.0.4`
+- 发布日期：`2026-04-01`
 - 更新日志：见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 最近更新
 
-- 为 `GameAPI` 会话启用隔离的 `DummyCookieJar`，避免多用户轮询时 Cookie 串号
-- 修复“部分播报群发送失败时基线仍然前移”的问题，失败目标会进入待重试队列
-- 为 `df解绑`、`df取消群绑定` 和手动 `df检查` 的失败落盘场景补齐错误处理与提示
-- 清理 `red_detector.py` 中残留的损坏字符串与日志文案，统一调试摘要分类
-- 补充回归测试，覆盖 CookieJar 选择、失败群重试和解绑/取消群绑定写盘失败场景
+- 登录重定向改为逐跳手动校验白名单，并收窄网络异常捕获范围，减少安全绕过和误吞本地异常的风险
+- 运行目录异常回退统一到 `data/plugin_data/astrbot_plugin_deltaforce_loot_broadcast/`，凭证解密失败也会显式提示
+- 同一发送者重新绑定账号时会重置旧账号基线与待重试播报，避免跨账号串状态
+- 检查流程改为先保存基线再播报，降低超时或写盘失败导致重复播报的概率
+- `df刷新物品缓存` 能区分远程刷新成功与缓存回退，`df检查` 系列命令也不再向用户暴露原始异常细节
+- 补充回归测试，覆盖重绑定状态清理、缓存回退提示、基线持久化顺序和脱敏错误展示
 
 ## 功能特性
 
@@ -54,7 +55,7 @@
 插件会把物品列表缓存到：
 
 - AstrBot 安装环境下：`data/plugin_data/astrbot_plugin_deltaforce_loot_broadcast/item_catalog_cache.json`
-- 非 AstrBot 标准目录下：插件目录内的 `.runtime_data/item_catalog_cache.json`
+- 非 AstrBot 标准目录下：当前工作目录下的 `data/plugin_data/astrbot_plugin_deltaforce_loot_broadcast/item_catalog_cache.json`（旧版 `.runtime_data/` 数据会自动迁移）
 
 说明：
 

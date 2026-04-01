@@ -28,6 +28,7 @@ class RedDetector:
         self._owns_api = api is None
         self.context = context
         self.check_counters = {}
+        self.credential_error_users = set()
         self.debug_dir = Path(get_runtime_debug_dir())
         self.max_parallel_user_checks = MAX_PARALLEL_USER_CHECKS
         self.max_parallel_broadcasts = MAX_PARALLEL_BROADCASTS
@@ -47,6 +48,7 @@ class RedDetector:
 
     def clear_user_runtime_state(self, sender_id):
         self.check_counters.pop(str(sender_id), None)
+        self.credential_error_users.discard(str(sender_id))
 
     @staticmethod
     def _normalize_origin(origin):
@@ -750,6 +752,15 @@ class RedDetector:
         if self._normalize_pending_broadcasts(user_data.get("pending_broadcasts", [])):
             await self.retry_pending_broadcasts(sender_id, user_data)
 
+        if user_data.get("_secret_errors"):
+            if sender_id not in self.credential_error_users:
+                logger.warning(
+                    f"Skipping user {sender_id} because stored credentials could not be decrypted."
+                )
+                self.credential_error_users.add(sender_id)
+            return
+        self.credential_error_users.discard(sender_id)
+
         openid = user_data.get("openid")
         access_token = user_data.get("access_token")
         platform = (user_data.get("platform", "qq") or "qq").strip().lower()
@@ -864,6 +875,11 @@ class RedDetector:
             "last_match_time": current_match_time,
             "last_room_id": current_room_id,
         }
+        await self.storage.update_user_state(
+            sender_id,
+            **update_fields,
+        )
+        user_data.update(update_fields)
         if detected_items:
             latest_match = await self._enrich_match_info(
                 openid,
@@ -895,17 +911,22 @@ class RedDetector:
                     broadcast_result.get("failed_groups", []),
                     match_info=latest_match,
                 )
-                update_fields["pending_broadcasts"] = pending_broadcasts
-                user_data["pending_broadcasts"] = pending_broadcasts
-                logger.warning(
-                    f"Queued retry for {len(broadcast_result.get('failed_groups', []))} "
-                    f"failed broadcast targets for user {sender_id}."
-                )
-
-        await self.storage.update_user_state(
-            sender_id,
-            **update_fields,
-        )
+                try:
+                    await self.storage.update_user_state(
+                        sender_id,
+                        pending_broadcasts=pending_broadcasts,
+                    )
+                except OSError as exc:
+                    logger.error(
+                        f"Failed to persist pending broadcast retries for user {sender_id}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    user_data["pending_broadcasts"] = pending_broadcasts
+                    logger.warning(
+                        f"Queued retry for {len(broadcast_result.get('failed_groups', []))} "
+                        f"failed broadcast targets for user {sender_id}."
+                    )
 
     async def broadcast_message(self, message, origins=None, *, write_debug_snapshot=False, log_prefix="Broadcasting message"):
         if origins is None:
@@ -948,7 +969,7 @@ class RedDetector:
                     logger.error(f"Broadcast to group {origin} failed: {error_message}")
                     return False, {
                         "origin": origin,
-                        "error": error_message,
+                        "error": "发送失败，请查看日志。",
                     }
 
         outcomes = await asyncio.gather(*(send_to_group(origin) for origin in groups))

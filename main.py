@@ -15,7 +15,7 @@ from .monitor.red_detector import RedDetector
 MAX_LOGIN_ATTEMPTS = 120
 LOGIN_ATTEMPT_INTERVAL = 0.5
 
-@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.3")
+@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.4")
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -29,6 +29,22 @@ class DeltaForceRedPlugin(Star):
             f"Command {command_name} failed for sender {sender_id}: "
             f"{type(exc).__name__}: {exc}"
         )
+
+    @staticmethod
+    def _get_secret_error_hint(user_data):
+        if not isinstance(user_data, dict):
+            return ""
+        if not user_data.get("_secret_errors"):
+            return ""
+        return "已保存的账号凭证无法解密，请先解绑后重新绑定。"
+
+    @staticmethod
+    def _format_failed_group_lines(failed_groups):
+        lines = []
+        for item in failed_groups[:5]:
+            origin = str(item.get("origin", "")).strip() or "未知目标"
+            lines.append(f"- {origin} -> 发送失败，请查看日志。")
+        return "\n".join(lines) or "- 未拿到具体错误信息"
 
     async def _finish_bind(self, sender_id: str, user_name: str, platform: str, openid: str, access_token: str):
         bind_res = await self.command_api.bind_account(access_token, openid, platform)
@@ -50,6 +66,7 @@ class DeltaForceRedPlugin(Star):
         except OSError as exc:
             logger.error(f"Failed to persist bound account for sender {sender_id}: {exc}")
             return False, "绑定信息保存失败，请检查插件运行目录写入权限后重试。"
+        self.detector.clear_user_runtime_state(sender_id)
         role_suffix = f" 角色ID：{role_id}" if role_id else ""
         return True, f"绑定成功！已为玩家 {user_name} 开启大红物品监测。平台：{platform.upper()}{role_suffix}"
 
@@ -213,22 +230,32 @@ class DeltaForceRedPlugin(Star):
             yield event.plain_result("您还未绑定账号！无法刷新物品缓存。")
             return
 
+        secret_error_hint = self._get_secret_error_hint(user_data)
+        if secret_error_hint:
+            yield event.plain_result(secret_error_hint)
+            return
+
         openid = user_data.get("openid")
         access_token = user_data.get("access_token")
         platform = (user_data.get("platform", "qq") or "qq").strip().lower()
         if platform != "qq":
             yield event.plain_result("当前版本仅支持 QQ 账号检测，请先解绑后重新使用 df绑定。")
             return
-        items = await self.detector.api.fetch_item_catalog(
+        refresh_result = await self.detector.api.refresh_item_catalog(
             openid,
             access_token,
-            force_refresh=True,
             platform=platform,
         )
+        items = refresh_result.get("items", [])
+        if refresh_result.get("status"):
+            yield event.plain_result(f"物品缓存刷新成功，共 {len(items)} 条。")
+            return
         if not items:
             yield event.plain_result("❌ 刷新物品缓存失败。")
             return
-        yield event.plain_result(f"物品缓存刷新成功，共 {len(items)} 条。")
+        yield event.plain_result(
+            f"❌ 远程刷新失败，当前仍在使用本地缓存，共 {len(items)} 条。"
+        )
 
     @filter.command("df检查")
     async def check_now(self, event: AstrMessageEvent):
@@ -238,9 +265,14 @@ class DeltaForceRedPlugin(Star):
         if not user_data:
             yield event.plain_result("您还未绑定账号！无法进行检测诊断。")
             return
-            
+
+        secret_error_hint = self._get_secret_error_hint(user_data)
+        if secret_error_hint:
+            yield event.plain_result(secret_error_hint)
+            return
+
         yield event.plain_result("正在检查最近一局，请稍候...")
-        
+
         openid = user_data.get("openid")
         access_token = user_data.get("access_token")
         platform = (user_data.get("platform", "qq") or "qq").strip().lower()
@@ -296,19 +328,13 @@ class DeltaForceRedPlugin(Star):
                         f"最近一局已成功播报到 {len(success_groups)}/{total_groups} 个播报群。"
                     )
                     if failed_groups:
-                        failed_lines = "\n".join(
-                            f"- {item.get('origin')} -> {item.get('error')}"
-                            for item in failed_groups[:5]
-                        )
+                        failed_lines = self._format_failed_group_lines(failed_groups)
                         yield event.plain_result(
                             "以下播报群发送失败，请检查平台是否支持主动消息，或重新执行 df设置群：\n"
                             f"{failed_lines}"
                         )
                 else:
-                    failed_lines = "\n".join(
-                        f"- {item.get('origin')} -> {item.get('error')}"
-                        for item in failed_groups[:5]
-                    ) or "- 未拿到具体错误信息"
+                    failed_lines = self._format_failed_group_lines(failed_groups)
                     yield event.plain_result(
                         "检测到了收集品，但主动播报到已配置群全部失败。\n"
                         "这通常是平台不支持主动消息，或保存的播报群会话已失效。\n"
@@ -334,6 +360,11 @@ class DeltaForceRedPlugin(Star):
         user_data = await self.storage.get_user(sender_id)
         if not user_data:
             yield event.plain_result("您还未绑定账号！无法进行详细诊断。")
+            return
+
+        secret_error_hint = self._get_secret_error_hint(user_data)
+        if secret_error_hint:
+            yield event.plain_result(secret_error_hint)
             return
 
         yield event.plain_result("正在生成详细调试报告，请稍候...")

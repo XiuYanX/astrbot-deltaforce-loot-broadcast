@@ -9,7 +9,8 @@ LEGACY_PLUGIN_NAMES = (
     "astrbot_plugin_df_red",
 )
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-FALLBACK_RUNTIME_DIR = PLUGIN_ROOT / ".runtime_data"
+LEGACY_LOCAL_RUNTIME_DIR = PLUGIN_ROOT / ".runtime_data"
+FALLBACK_RUNTIME_DIR = (Path.cwd() / "data" / "plugin_data" / PLUGIN_NAME).resolve()
 _FRAMEWORK_RUNTIME_DIR = None
 _FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED = False
 
@@ -41,7 +42,8 @@ def _get_framework_runtime_dir():
         if not _FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED:
             logger.warning(
                 "Failed to resolve AstrBot plugin data dir via StarTools, "
-                f"falling back to local runtime dir: {type(exc).__name__}: {exc}"
+                "falling back to the conventional plugin data dir "
+                f"{FALLBACK_RUNTIME_DIR}: {type(exc).__name__}: {exc}"
             )
             _FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED = True
         return None
@@ -64,7 +66,7 @@ def _get_legacy_runtime_dirs():
         plugin_data_root = framework_runtime_dir.parent
         for legacy_name in LEGACY_PLUGIN_NAMES:
             legacy_dirs.append((plugin_data_root / legacy_name).resolve())
-    legacy_dirs.append(FALLBACK_RUNTIME_DIR.resolve())
+    legacy_dirs.append(LEGACY_LOCAL_RUNTIME_DIR.resolve())
 
     unique_dirs = []
     seen = set()
