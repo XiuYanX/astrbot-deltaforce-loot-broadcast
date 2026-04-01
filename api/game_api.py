@@ -7,7 +7,7 @@ import tempfile
 import time
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 
 import aiohttp
 from astrbot.api import logger
@@ -18,6 +18,10 @@ APPID = 101491592
 BASE_URL = "https://comm.ams.game.qq.com/ide/"
 GAME_API_URL = "https://comm.aci.game.qq.com/main"
 LOGIN_APP_ID = 716027609
+QQ_CONNECT_AUTHORIZE_URL = "https://graph.qq.com/oauth2.0/authorize"
+QQ_CONNECT_REDIRECT_URI = "https://milo.qq.com/comm-htdocs/login/qc_redirect.html"
+QQ_CONNECT_SCOPE = "get_user_info"
+QQ_CONNECT_STATE = "STATE"
 QQ_LOGIN_S_URL = "https://graph.qq.com/oauth2.0/login_jump"
 QQ_QR_SHOW_URL = "https://xui.ptlogin2.qq.com/ssl/ptqrshow"
 QQ_LOGIN_TICKET_URL = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin"
@@ -181,6 +185,72 @@ class GameAPI:
         normalized = cls._normalize_qq_login_config(login_config)
         headers["Referer"] = normalized.get("href") or QQ_LOGIN_TICKET_URL
         return headers
+
+    @staticmethod
+    def _build_qq_connect_authorize_params():
+        return {
+            "response_type": "code",
+            "client_id": str(APPID),
+            "redirect_uri": QQ_CONNECT_REDIRECT_URI,
+            "scope": QQ_CONNECT_SCOPE,
+            "state": QQ_CONNECT_STATE,
+            "display": "pc",
+        }
+
+    @classmethod
+    def _extract_qq_connect_xlogin_url_from_authorize_page(cls, payload):
+        payload_text = str(payload or "")
+        if not payload_text:
+            return ""
+
+        inner_login_jump = QQ_LOGIN_S_URL
+        login_jump_match = re.search(r"var s_url = '([^']+login_jump[^']*)';", payload_text)
+        if login_jump_match:
+            inner_login_jump = cls._decode_js_string_literal(login_jump_match.group(1))
+
+        xlogin_prefix_match = re.search(
+            r"s_url\s*=\s*'(https://xui\.ptlogin2\.qq\.com/cgi-bin/xlogin\?[^']*s_url=)'\s*\+\s*encodeURIComponent\(s_url\)",
+            payload_text,
+        )
+        if not xlogin_prefix_match:
+            return ""
+
+        xlogin_url = (
+            cls._decode_js_string_literal(xlogin_prefix_match.group(1))
+            + quote(inner_login_jump, safe="")
+        )
+
+        if "pt_3rd_aid=" not in xlogin_url:
+            xlogin_url += f"&pt_3rd_aid={quote(str(APPID), safe='')}"
+
+        return xlogin_url
+
+    @classmethod
+    def _merge_qq_login_config_from_url(cls, config, url):
+        merged = dict(config or {})
+        parsed_url = urlparse(str(url or ""))
+        params = parse_qs(parsed_url.query)
+        field_map = {
+            "appid": "appid",
+            "s_url": "s_url",
+            "style": "style",
+            "pt_3rd_aid": "pt_3rd_aid",
+            "daid": "daid",
+            "target": "target",
+        }
+        for key, param_name in field_map.items():
+            value = cls._normalize_message_text((params.get(param_name) or [""])[0])
+            if value:
+                if (
+                    key == "target"
+                    and str(merged.get("target", "")).strip()
+                    and value.lower() == "self"
+                ):
+                    continue
+                merged[key] = value
+        if str(url or "").strip():
+            merged["href"] = str(url)
+        return merged
 
     @classmethod
     def _extract_response_message(cls, payload):
@@ -596,25 +666,46 @@ class GameAPI:
         return (float(now) - updated_at) <= ITEM_CATALOG_CACHE_TTL_SECONDS
 
     async def get_login_token(self):
-        params = {
-            "appid": LOGIN_APP_ID,
-            "s_url": QQ_LOGIN_S_URL,
-        }
+        authorize_params = self._build_qq_connect_authorize_params()
+        authorize_url = f"{QQ_CONNECT_AUTHORIZE_URL}?{urlencode(authorize_params)}"
         try:
             response, result = await self._request_text(
                 "GET",
-                QQ_LOGIN_TICKET_URL,
-                params=params,
+                QQ_CONNECT_AUTHORIZE_URL,
+                params=authorize_params,
                 headers=self._get_headers(),
-                error_context="Failed to get login token",
+                error_context="Failed to get QQ connect authorize page",
             )
         except REQUEST_EXCEPTIONS:
             return {"status": False, "message": "获取登录token失败", "data": {}}
         if response["status"] != 200:
             return {"status": False, "message": "获取登录token失败", "data": {}}
 
-        cookies = self._parse_cookies(response.get("cookies", {}))
-        login_config = self._extract_qq_login_config_from_xlogin_page(result)
+        xlogin_url = self._extract_qq_connect_xlogin_url_from_authorize_page(result)
+        if not xlogin_url:
+            logger.warning("Failed to extract QQ xlogin URL from authorize page")
+            return {"status": False, "message": "获取登录token失败", "data": {}}
+
+        authorize_cookies = self._parse_cookies(response.get("cookies", {}))
+        try:
+            xlogin_response, xlogin_result = await self._request_text(
+                "GET",
+                xlogin_url,
+                headers={
+                    **self._get_headers(),
+                    "Referer": response.get("url") or authorize_url,
+                },
+                cookies=authorize_cookies,
+                error_context="Failed to get QQ login token",
+            )
+        except REQUEST_EXCEPTIONS:
+            return {"status": False, "message": "获取登录token失败", "data": {}}
+        if xlogin_response["status"] != 200:
+            return {"status": False, "message": "获取登录token失败", "data": {}}
+
+        cookies = self._merge_cookies(authorize_cookies, xlogin_response.get("cookies", {}))
+        login_config = self._extract_qq_login_config_from_xlogin_page(xlogin_result)
+        login_config = self._merge_qq_login_config_from_url(login_config, xlogin_url)
         login_sig = (
             self._normalize_message_text(login_config.get("login_sig"))
             or cookies.get("pt_login_sig", "")

@@ -470,6 +470,24 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["ptui_version"], "26030415")
         self.assertEqual(result["target"], "1")
 
+    def test_extract_qq_connect_xlogin_url_from_authorize_page(self):
+        payload = (
+            "Q.crtDomain = 'http://milo.qq.com';"
+            "Q.ptlogin2 = function(){"
+            "var s_url = 'https://graph.qq.com/oauth2.0/login_jump';"
+            "s_url = 'https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=' + encodeURIComponent(s_url);"
+            "var clientId = Q.getParameter('client_id') || '';"
+            "clientId && (s_url += (\"&pt_3rd_aid=\"+encodeURIComponent(clientId)));"
+            "};"
+        )
+
+        result = GameAPI._extract_qq_connect_xlogin_url_from_authorize_page(payload)
+
+        self.assertEqual(
+            result,
+            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump&pt_3rd_aid=101491592",
+        )
+
     def test_decode_response_bytes_falls_back_from_utf8_to_gb18030(self):
         class _DummyResponse:
             charset = "utf-8"
@@ -495,47 +513,88 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
             api,
             "_request_text",
             mock.AsyncMock(
-                return_value=(
-                    {
-                        "status": 200,
-                        "headers": {},
-                        "cookies": {"pt_login_sig": "sig-1", "foo": "bar"},
-                    },
+                side_effect=[
                     (
-                        'pt.ptui={'
-                        's_url:"https\\x3A\\x2F\\x2Fgraph.qq.com\\x2Foauth2.0\\x2Flogin_jump",'
-                        'href:"https\\x3A\\x2F\\x2Fxui.ptlogin2.qq.com\\x2Fcgi-bin\\x2Fxlogin\\x3Fappid\\x3D716027609",'
-                        'login_sig:"",'
-                        'ptui_version:encodeURIComponent("26030415"),'
-                        'appid:encodeURIComponent("716027609"),'
-                        'lang:encodeURIComponent("2052"),'
-                        'style:encodeURIComponent("40"),'
-                        'pt_3rd_aid:encodeURIComponent("0"),'
-                        'daid:encodeURIComponent(""),'
-                        'target:isNaN(parseInt("1"))'
-                        "};"
+                        {
+                            "status": 200,
+                            "url": "https://graph.qq.com/oauth2.0/authorize?client_id=101491592",
+                            "headers": {},
+                            "cookies": {"graph_key": "graph-1"},
+                        },
+                        (
+                            "Q.crtDomain = 'http://milo.qq.com';"
+                            "Q.ptlogin2 = function(){"
+                            "var s_url = 'https://graph.qq.com/oauth2.0/login_jump';"
+                            "s_url = 'https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=' + encodeURIComponent(s_url);"
+                            "var clientId = Q.getParameter('client_id') || '';"
+                            "clientId && (s_url += (\"&pt_3rd_aid=\"+encodeURIComponent(clientId)));"
+                            "};"
+                        ),
                     ),
-                )
+                    (
+                        {
+                            "status": 200,
+                            "url": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&pt_3rd_aid=101491592",
+                            "headers": {},
+                            "cookies": {"pt_login_sig": "sig-1", "foo": "bar"},
+                        },
+                        (
+                            'pt.ptui={'
+                            's_url:"https\\x3A\\x2F\\x2Fgraph.qq.com\\x2Foauth2.0\\x2Flogin_jump",'
+                            'href:"https\\x3A\\x2F\\x2Fxui.ptlogin2.qq.com\\x2Fcgi-bin\\x2Fxlogin\\x3Fappid\\x3D716027609\\x26daid\\x3D383\\x26style\\x3D33\\x26target\\x3Dself\\x26pt_3rd_aid\\x3D101491592",'
+                            'login_sig:"",'
+                            'ptui_version:encodeURIComponent("26030415"),'
+                            'appid:encodeURIComponent("716027609"),'
+                            'lang:encodeURIComponent("2052"),'
+                            'style:encodeURIComponent("33"),'
+                            'pt_3rd_aid:encodeURIComponent("101491592"),'
+                            'daid:encodeURIComponent("383"),'
+                            'target:isNaN(parseInt("1"))'
+                            "};"
+                        ),
+                    ),
+                ]
             ),
-        ):
+        ) as request_mock:
             result = await api.get_login_token()
 
         self.assertTrue(result["status"])
+        self.assertEqual(request_mock.await_count, 2)
+        self.assertEqual(
+            request_mock.await_args_list[0].args[1],
+            "https://graph.qq.com/oauth2.0/authorize",
+        )
+        self.assertEqual(
+            request_mock.await_args_list[0].kwargs["params"]["client_id"],
+            "101491592",
+        )
+        self.assertEqual(
+            request_mock.await_args_list[1].args[1],
+            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump&pt_3rd_aid=101491592",
+        )
+        self.assertEqual(
+            request_mock.await_args_list[1].kwargs["headers"]["Referer"],
+            "https://graph.qq.com/oauth2.0/authorize?client_id=101491592",
+        )
+        self.assertEqual(
+            request_mock.await_args_list[1].kwargs["cookies"],
+            {"graph_key": "graph-1"},
+        )
         self.assertEqual(
             result["data"],
             {
-                "cookie": {"pt_login_sig": "sig-1", "foo": "bar"},
+                "cookie": {"graph_key": "graph-1", "pt_login_sig": "sig-1", "foo": "bar"},
                 "loginSig": "sig-1",
                 "loginConfig": {
                     "appid": "716027609",
                     "s_url": "https://graph.qq.com/oauth2.0/login_jump",
-                    "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+                    "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump&pt_3rd_aid=101491592",
                     "login_sig": "",
                     "ptui_version": "26030415",
                     "lang": "2052",
-                    "style": "40",
-                    "pt_3rd_aid": "0",
-                    "daid": "",
+                    "style": "33",
+                    "pt_3rd_aid": "101491592",
+                    "daid": "383",
                     "target": "1",
                 },
             },
