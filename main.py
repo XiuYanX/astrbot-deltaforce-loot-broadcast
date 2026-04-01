@@ -14,8 +14,9 @@ from .monitor.red_detector import RedDetector
 
 MAX_LOGIN_ATTEMPTS = 120
 LOGIN_ATTEMPT_INTERVAL = 0.5
+MAX_TRANSIENT_LOGIN_STATUS_FAILURES = 12
 
-@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.4")
+@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.5")
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -31,12 +32,49 @@ class DeltaForceRedPlugin(Star):
         )
 
     @staticmethod
+    def _sanitize_notify_origin(origin: str, sender_id: str = ""):
+        return Storage.sanitize_private_notify_origin(origin, sender_id=sender_id)
+
+    @staticmethod
+    def _normalize_interaction_origin(origin: str, sender_id: str = ""):
+        return Storage.normalize_interaction_origin(origin, sender_id=sender_id)
+
+    @staticmethod
+    def _is_private_chat_event(event: AstrMessageEvent) -> bool:
+        is_private_chat = getattr(event, "is_private_chat", None)
+        if callable(is_private_chat):
+            try:
+                return bool(is_private_chat())
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to inspect event private-chat state: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        raw_origin = str(getattr(event, "unified_msg_origin", "") or "")
+        return bool(Storage.sanitize_private_notify_origin(raw_origin))
+
+    @staticmethod
     def _get_secret_error_hint(user_data):
         if not isinstance(user_data, dict):
             return ""
         if not user_data.get("_secret_errors"):
             return ""
-        return "已保存的账号凭证无法解密，请先解绑后重新绑定。"
+        return "已保存的账号凭证无法解密，请重新执行 df绑定 以覆盖旧绑定；若仍失败，再执行 df解绑 后重试。"
+
+    @staticmethod
+    def _get_binding_invalid_hint(user_data):
+        if not isinstance(user_data, dict):
+            return ""
+        if str(user_data.get("binding_status", "")).strip().lower() != "invalid":
+            return ""
+        reason = str(user_data.get("binding_status_reason", "")).strip()
+        if reason:
+            return (
+                "当前保存的绑定已失效，后台监测已暂停。\n"
+                "请重新执行 df绑定 以覆盖旧绑定。\n"
+                f"原因：{reason}"
+            )
+        return "当前保存的绑定已失效，后台监测已暂停，请重新执行 df绑定。"
 
     @staticmethod
     def _format_failed_group_lines(failed_groups):
@@ -46,7 +84,30 @@ class DeltaForceRedPlugin(Star):
             lines.append(f"- {origin} -> 发送失败，请查看日志。")
         return "\n".join(lines) or "- 未拿到具体错误信息"
 
-    async def _finish_bind(self, sender_id: str, user_name: str, platform: str, openid: str, access_token: str):
+    async def _finish_bind(
+        self,
+        sender_id: str,
+        user_name: str,
+        platform: str,
+        openid: str,
+        access_token: str,
+        notify_origin: str = "",
+    ):
+        interaction_origin = self._normalize_interaction_origin(notify_origin, sender_id=sender_id)
+        safe_notify_origin = self._sanitize_notify_origin(notify_origin, sender_id=sender_id)
+        existing_user = None
+        if not safe_notify_origin or not interaction_origin:
+            existing_user = await self.storage.get_user(sender_id)
+            if isinstance(existing_user, dict) and not safe_notify_origin:
+                safe_notify_origin = self._sanitize_notify_origin(
+                    existing_user.get("notify_origin", ""),
+                    sender_id=sender_id,
+                )
+            if isinstance(existing_user, dict) and not interaction_origin:
+                interaction_origin = self._normalize_interaction_origin(
+                    existing_user.get("interaction_origin", ""),
+                    sender_id=sender_id,
+                )
         bind_res = await self.command_api.bind_account(access_token, openid, platform)
         if not bind_res.get("status"):
             return False, bind_res.get("message", "绑定失败")
@@ -59,6 +120,8 @@ class DeltaForceRedPlugin(Star):
                 name=user_name,
                 platform=platform,
                 role_id=role_id,
+                notify_origin=safe_notify_origin,
+                interaction_origin=interaction_origin,
             )
         except SecretProtectionError as exc:
             logger.error(f"Failed to persist bound account for sender {sender_id}: {exc}")
@@ -69,6 +132,38 @@ class DeltaForceRedPlugin(Star):
         self.detector.clear_user_runtime_state(sender_id)
         role_suffix = f" 角色ID：{role_id}" if role_id else ""
         return True, f"绑定成功！已为玩家 {user_name} 开启大红物品监测。平台：{platform.upper()}{role_suffix}"
+
+    async def _remember_user_origin(self, sender_id: str, event: AstrMessageEvent, user_data=None):
+        raw_origin = getattr(event, "unified_msg_origin", "")
+        interaction_origin = self._normalize_interaction_origin(
+            raw_origin,
+            sender_id=sender_id,
+        )
+        if not interaction_origin:
+            return
+        notify_origin = ""
+        if self._is_private_chat_event(event):
+            notify_origin = interaction_origin
+        updates = {}
+        if (
+            not isinstance(user_data, dict)
+            or str(user_data.get("interaction_origin", "")).strip() != interaction_origin
+        ):
+            updates["interaction_origin"] = interaction_origin
+        if notify_origin and (
+            not isinstance(user_data, dict)
+            or str(user_data.get("notify_origin", "")).strip() != notify_origin
+        ):
+            updates["notify_origin"] = notify_origin
+        if not updates:
+            return
+        try:
+            await self.storage.update_user_state(sender_id, **updates)
+        except OSError as exc:
+            logger.warning(f"Failed to persist user origins for sender {sender_id}: {exc}")
+            return
+        if isinstance(user_data, dict):
+            user_data.update(updates)
 
     async def _bind_with_qq_qr(self, event: AstrMessageEvent):
         qr_res = await self.command_api.get_qq_login_qr()
@@ -91,11 +186,15 @@ class DeltaForceRedPlugin(Star):
         qr_sig = data.get("qrSig", "")
         qr_token = data.get("qrToken", "")
         login_sig = data.get("loginSig", "")
+        consecutive_status_failures = 0
+        last_status_error = ""
 
         for _ in range(MAX_LOGIN_ATTEMPTS):
             status_res = await self.command_api.get_login_status(cookie, qr_sig, qr_token, login_sig)
             code = status_res.get("code")
             if code == 0:
+                consecutive_status_failures = 0
+                last_status_error = ""
                 cookie = status_res.get("data", {}).get("cookie", cookie)
                 token_res = await self.command_api.get_access_token_by_cookie(cookie)
                 if not token_res.get("status"):
@@ -108,14 +207,35 @@ class DeltaForceRedPlugin(Star):
                     "qq",
                     token_data.get("openid", ""),
                     token_data.get("access_token", ""),
+                    notify_origin=str(getattr(event, "unified_msg_origin", "") or ""),
                 )
                 yield event.plain_result(message if success else f"❌ {message}")
                 return
-            if code in (-4, -2, -3):
+            if code in (1, 2):
+                consecutive_status_failures = 0
+                last_status_error = ""
+            elif code in (-4, -5):
+                consecutive_status_failures += 1
+                last_status_error = status_res.get("message", "获取登录状态失败")
+                logger.warning(
+                    "QQ login status poll failed transiently "
+                    f"({consecutive_status_failures}/{MAX_TRANSIENT_LOGIN_STATUS_FAILURES}): "
+                    f"{last_status_error}"
+                )
+                if consecutive_status_failures >= MAX_TRANSIENT_LOGIN_STATUS_FAILURES:
+                    yield event.plain_result(f"❌ QQ登录失败：{last_status_error}")
+                    return
+            elif code in (-1, -2, -3):
+                yield event.plain_result(f"❌ QQ登录失败：{status_res.get('message', '未知错误')}")
+                return
+            elif isinstance(code, int) and code < 0:
                 yield event.plain_result(f"❌ QQ登录失败：{status_res.get('message', '未知错误')}")
                 return
             await asyncio.sleep(LOGIN_ATTEMPT_INTERVAL)
 
+        if last_status_error:
+            yield event.plain_result(f"❌ QQ登录超时，请重新尝试。最近一次状态查询错误：{last_status_error}")
+            return
         yield event.plain_result("❌ QQ登录超时，请重新尝试。")
 
     async def initialize(self):
@@ -211,28 +331,55 @@ class DeltaForceRedPlugin(Star):
     @filter.command("df状态")
     async def status(self, event: AstrMessageEvent):
         """查看当前绑定状态与播报群状态"""
-        users = await self.storage.get_users()
-        groups = await self.storage.get_groups()
         sender_id = str(event.get_sender_id())
-        
-        bind_status = "已绑定" if sender_id in users else "未绑定"
+        user_data = await self.storage.get_user(sender_id)
+        if user_data:
+            await self._remember_user_origin(sender_id, event, user_data=user_data)
+        groups = await self.storage.get_groups()
         group_counts = len(groups)
-        
-        reply = f"【当前绑定状态】：{bind_status}\n【当前共有播报群数量】：{group_counts} 个"
+
+        if not user_data:
+            account_status = "未保存绑定记录"
+            binding_status = "无"
+            binding_reason = ""
+        elif user_data.get("_secret_errors"):
+            account_status = "已保存绑定记录"
+            binding_status = "已失效"
+            binding_reason = "已保存的账号凭证无法解密"
+        elif str(user_data.get("binding_status", "")).strip().lower() == "invalid":
+            account_status = "已保存绑定记录"
+            binding_status = "已失效"
+            binding_reason = str(user_data.get("binding_status_reason", "")).strip()
+        else:
+            account_status = "已保存绑定记录"
+            binding_status = "有效"
+            binding_reason = ""
+
+        reply = (
+            f"【账号记录】：{account_status}\n"
+            f"【绑定状态】：{binding_status}\n"
+            f"{f'【失效原因】：{binding_reason}\n' if binding_reason else ''}"
+            f"【当前共有播报群数量】：{group_counts} 个"
+        )
         yield event.plain_result(reply)
 
     @filter.command("df刷新物品缓存")
     async def refresh_item_catalog(self, event: AstrMessageEvent):
         """强制刷新本地物品缓存"""
-        sender_id = event.get_sender_id()
+        sender_id = str(event.get_sender_id())
         user_data = await self.storage.get_user(sender_id)
         if not user_data:
             yield event.plain_result("您还未绑定账号！无法刷新物品缓存。")
             return
+        await self._remember_user_origin(sender_id, event, user_data=user_data)
 
         secret_error_hint = self._get_secret_error_hint(user_data)
         if secret_error_hint:
             yield event.plain_result(secret_error_hint)
+            return
+        binding_invalid_hint = self._get_binding_invalid_hint(user_data)
+        if binding_invalid_hint:
+            yield event.plain_result(binding_invalid_hint)
             return
 
         openid = user_data.get("openid")
@@ -260,15 +407,20 @@ class DeltaForceRedPlugin(Star):
     @filter.command("df检查")
     async def check_now(self, event: AstrMessageEvent):
         """直接检查最近一局，并按正式播报逻辑返回结果"""
-        sender_id = event.get_sender_id()
+        sender_id = str(event.get_sender_id())
         user_data = await self.storage.get_user(sender_id)
         if not user_data:
             yield event.plain_result("您还未绑定账号！无法进行检测诊断。")
             return
+        await self._remember_user_origin(sender_id, event, user_data=user_data)
 
         secret_error_hint = self._get_secret_error_hint(user_data)
         if secret_error_hint:
             yield event.plain_result(secret_error_hint)
+            return
+        binding_invalid_hint = self._get_binding_invalid_hint(user_data)
+        if binding_invalid_hint:
+            yield event.plain_result(binding_invalid_hint)
             return
 
         yield event.plain_result("正在检查最近一局，请稍候...")
@@ -356,15 +508,20 @@ class DeltaForceRedPlugin(Star):
     @filter.command("df检查详细")
     async def check_debug(self, event: AstrMessageEvent):
         """输出本局带出/收集品判定的详细调试信息"""
-        sender_id = event.get_sender_id()
+        sender_id = str(event.get_sender_id())
         user_data = await self.storage.get_user(sender_id)
         if not user_data:
             yield event.plain_result("您还未绑定账号！无法进行详细诊断。")
             return
+        await self._remember_user_origin(sender_id, event, user_data=user_data)
 
         secret_error_hint = self._get_secret_error_hint(user_data)
         if secret_error_hint:
             yield event.plain_result(secret_error_hint)
+            return
+        binding_invalid_hint = self._get_binding_invalid_hint(user_data)
+        if binding_invalid_hint:
+            yield event.plain_result(binding_invalid_hint)
             return
 
         yield event.plain_result("正在生成详细调试报告，请稍候...")

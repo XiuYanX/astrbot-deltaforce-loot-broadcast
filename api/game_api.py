@@ -52,6 +52,7 @@ ALLOWED_REDIRECT_HOSTS = frozenset(
         "xui.ptlogin2.qq.com",
     }
 )
+ITEM_CATALOG_CACHE_TTL_SECONDS = 12 * 60 * 60
 
 class GameAPI:
     def __init__(self, platform="qq", timeout=REQUEST_TIMEOUT):
@@ -104,6 +105,59 @@ class GameAPI:
             "Referer": "https://df.qq.com/",
             "Content-Type": "application/x-www-form-urlencoded",
         }
+
+    @staticmethod
+    def _normalize_message_text(value):
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            return ""
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "null", "unknown"}:
+            return ""
+        return text
+
+    @classmethod
+    def _extract_response_message(cls, payload):
+        if not isinstance(payload, dict):
+            return ""
+
+        candidates = [payload]
+        seen = set()
+        while candidates:
+            current = candidates.pop(0)
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+
+            for key in ("message", "msg", "sMsg", "errMsg", "errmsg", "retMsg"):
+                message = cls._normalize_message_text(current.get(key))
+                if message:
+                    return message
+
+            for key in ("jData", "data", "bindarea"):
+                value = current.get(key)
+                if isinstance(value, dict):
+                    candidates.append(value)
+
+        return ""
+
+    @staticmethod
+    def _is_credential_expired_message(message):
+        message_text = str(message or "").strip()
+        if not message_text:
+            return False
+        invalid_tokens = (
+            "鉴权",
+            "过期",
+            "重新扫码登录",
+            "cookie无效",
+            "cookie过期",
+            "登录失效",
+        )
+        lowered_message = message_text.lower()
+        return any(token in message_text for token in invalid_tokens) or any(
+            token in lowered_message for token in ("cookie invalid", "cookie expired")
+        )
 
     @staticmethod
     def _get_gtk(p_skey, h=5381):
@@ -417,6 +471,26 @@ class GameAPI:
         except OSError as exc:
             logger.debug(f"Failed to save item catalog cache: {type(exc).__name__}: {exc}")
 
+    @staticmethod
+    def _get_item_catalog_cache_updated_at(cache_data):
+        if not isinstance(cache_data, dict):
+            return 0
+        try:
+            return int(cache_data.get("updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _is_item_catalog_cache_fresh(cls, cache_data, now=None):
+        if not isinstance(cache_data, dict) or not isinstance(cache_data.get("items"), list):
+            return False
+        updated_at = cls._get_item_catalog_cache_updated_at(cache_data)
+        if updated_at <= 0:
+            return False
+        if now is None:
+            now = time.time()
+        return (float(now) - updated_at) <= ITEM_CATALOG_CACHE_TTL_SECONDS
+
     async def get_login_token(self):
         params = {
             "appid": LOGIN_APP_ID,
@@ -441,8 +515,19 @@ class GameAPI:
                 error_context="Failed to get login token",
             )
         except REQUEST_EXCEPTIONS:
-            return False
-        return response["status"] == 200
+            return {"status": False, "message": "获取登录token失败", "data": {}}
+        if response["status"] != 200:
+            return {"status": False, "message": "获取登录token失败", "data": {}}
+
+        cookies = self._parse_cookies(response.get("cookies", {}))
+        return {
+            "status": True,
+            "message": "获取成功",
+            "data": {
+                "cookie": cookies,
+                "loginSig": cookies.get("pt_login_sig", ""),
+            },
+        }
 
     @staticmethod
     def _calc_qr_token(qrsig):
@@ -452,8 +537,13 @@ class GameAPI:
         return e & 2147483647
 
     async def get_qq_login_qr(self):
-        if not await self.get_login_token():
-            return {"status": False, "message": "获取登录token失败", "data": {}}
+        login_token = await self.get_login_token()
+        if not login_token.get("status"):
+            return {
+                "status": False,
+                "message": login_token.get("message", "获取登录token失败"),
+                "data": {},
+            }
 
         params = {
             "appid": LOGIN_APP_ID,
@@ -473,6 +563,7 @@ class GameAPI:
                 QQ_QR_SHOW_URL,
                 params=params,
                 headers=self._get_headers(),
+                cookies=login_token.get("data", {}).get("cookie", {}),
                 error_context="Failed to get QQ login QR",
             )
         except REQUEST_EXCEPTIONS:
@@ -481,9 +572,15 @@ class GameAPI:
         if response["status"] != 200:
             return {"status": False, "message": "获取二维码失败", "data": {}}
 
-        cookie_dict = response["cookies"]
+        cookie_dict = self._merge_cookies(
+            login_token.get("data", {}).get("cookie", {}),
+            response["cookies"],
+        )
         qr_sig_value = cookie_dict.get("qrsig", "")
-        login_sig_value = cookie_dict.get("pt_login_sig", "")
+        login_sig_value = (
+            str(login_token.get("data", {}).get("loginSig", "")).strip()
+            or cookie_dict.get("pt_login_sig", "")
+        )
         if not qr_sig_value:
             return {"status": False, "message": "获取二维码失败，请重试", "data": {}}
 
@@ -535,10 +632,16 @@ class GameAPI:
                 cookies=cookies,
                 error_context="Failed to get QQ login status",
             )
-        except REQUEST_EXCEPTIONS:
+        except REQUEST_EXCEPTIONS as exc:
+            logger.warning(
+                f"Failed to get QQ login status: {type(exc).__name__}: {exc}"
+            )
             return {"code": -4, "message": "获取登录状态失败", "data": {}}
 
         if response["status"] != 200:
+            logger.warning(
+                f"Unexpected QQ login status response code: {response['status']}"
+            )
             return {"code": -5, "message": "响应错误", "data": {}}
         if not result:
             return {"code": -1, "message": "qrSig参数不正确", "data": {}}
@@ -546,6 +649,9 @@ class GameAPI:
         pattern = r"ptuiCB\s*\(\s*'(.*?)'\s*,\s*'(.*?)'\s*,\s*'(.*?)'\s*,\s*'(.*?)'\s*,\s*'(.*?)'\s*,\s*'(.*?)'\s*\)"
         matches = re.search(pattern, result)
         if not matches:
+            logger.warning(
+                f"Unexpected QQ login status payload: {result[:160]!r}"
+            )
             return {"code": -4, "message": "响应格式错误", "data": {}}
 
         code = matches.group(1)
@@ -576,7 +682,10 @@ class GameAPI:
                 cookies=merged_cookies,
                 error_context="Failed to finalize QQ login status",
             )
-        except REQUEST_EXCEPTIONS:
+        except REQUEST_EXCEPTIONS as exc:
+            logger.warning(
+                f"Failed to finalize QQ login status: {type(exc).__name__}: {exc}"
+            )
             return {"code": -4, "message": "获取登录状态失败", "data": {}}
 
         all_cookies = self._merge_cookies(merged_cookies, redirect_response["cookies"])
@@ -791,7 +900,7 @@ class GameAPI:
     async def bind_account(self, access_token, openid, platform=None):
         access_type = platform or self.platform
         if not openid or not access_token:
-            return {"status": False, "message": "缺少参数", "data": {}}
+            return {"status": False, "message": "缺少参数", "error_kind": "invalid_request", "data": {}}
 
         cookies = self._get_cookies(openid, access_token, access_type)
         form_data = {
@@ -806,10 +915,17 @@ class GameAPI:
                 error_context="Failed to fetch bind area",
             )
         except REQUEST_EXCEPTIONS:
-            return {"status": False, "message": "绑定失败", "data": {}}
+            return {"status": False, "message": "绑定失败", "error_kind": "upstream_error", "data": {}}
 
         if data.get("ret") != 0:
-            return {"status": False, "message": "获取失败,检查鉴权是否过期", "data": {}}
+            response_message = self._extract_response_message(data)
+            error_kind = "credential_expired" if self._is_credential_expired_message(response_message) else "upstream_error"
+            return {
+                "status": False,
+                "message": response_message or f"绑定状态校验失败(ret={data.get('ret')})",
+                "error_kind": error_kind,
+                "data": {"ret": data.get("ret")},
+            }
 
         bindarea = data.get("jData", {}).get("bindarea") or {}
         role_id = str(
@@ -832,7 +948,7 @@ class GameAPI:
         checkparam = role_data.get("checkparam", "")
         checkparam_parts = checkparam.split("|")
         if len(checkparam_parts) < 3:
-            return {"status": False, "message": "角色信息解析失败", "data": {}}
+            return {"status": False, "message": "角色信息解析失败", "error_kind": "unexpected_payload", "data": {}}
 
         role_id = role_id or checkparam_parts[2]
         bind_form = {
@@ -853,10 +969,17 @@ class GameAPI:
                 error_context="Failed to bind role",
             )
         except REQUEST_EXCEPTIONS:
-            return {"status": False, "message": "绑定失败", "data": {}}
+            return {"status": False, "message": "绑定失败", "error_kind": "upstream_error", "data": {}}
 
         if bind_result.get("ret") != 0:
-            return {"status": False, "message": "绑定失败", "data": {}}
+            response_message = self._extract_response_message(bind_result)
+            error_kind = "credential_expired" if self._is_credential_expired_message(response_message) else "upstream_error"
+            return {
+                "status": False,
+                "message": response_message or f"绑定角色失败(ret={bind_result.get('ret')})",
+                "error_kind": error_kind,
+                "data": {"ret": bind_result.get("ret")},
+            }
 
         bind_data = bind_result.get("jData", {}).get("bindarea", {}) or {}
         if role_id:
@@ -1095,15 +1218,30 @@ class GameAPI:
             "source": "none",
         }
 
-    async def fetch_item_catalog(self, openid, access_token, force_refresh=False, platform=None):
+    async def fetch_item_catalog(
+        self,
+        openid,
+        access_token,
+        force_refresh=False,
+        platform=None,
+        return_metadata=False,
+    ):
         """
         获取并缓存物品列表。
         物品信息相对稳定，默认优先读取本地缓存。
         """
-        if not force_refresh:
-            cached = self._load_item_catalog_cache()
-            if cached:
-                return cached.get("items", [])
+        cached = self._load_item_catalog_cache()
+        cache_is_fresh = self._is_item_catalog_cache_fresh(cached)
+        if not force_refresh and cache_is_fresh:
+            items = cached.get("items", [])
+            if return_metadata:
+                return {
+                    "items": items,
+                    "source": "cache",
+                    "cache_status": "fresh",
+                    "used_stale_cache": False,
+                }
+            return items
 
         items = await self._fetch_item_catalog_from_remote(
             openid,
@@ -1111,9 +1249,31 @@ class GameAPI:
             platform=platform,
         )
         if items is not None:
+            if return_metadata:
+                return {
+                    "items": items,
+                    "source": "network",
+                    "cache_status": "refreshed" if cached else "network",
+                    "used_stale_cache": False,
+                }
             return items
 
-        cached = self._load_item_catalog_cache()
         if cached:
-            return cached.get("items", [])
-        return []
+            cached_items = cached.get("items", [])
+            used_stale_cache = not cache_is_fresh
+            if not cache_is_fresh:
+                logger.warning(
+                    "Failed to refresh stale item catalog from remote; "
+                    "falling back to cached data."
+                )
+            if return_metadata:
+                return {
+                    "items": cached_items,
+                    "source": "cache",
+                    "cache_status": "stale_fallback" if used_stale_cache else "cache_fallback",
+                    "used_stale_cache": used_stale_cache,
+                }
+            return cached_items
+        if return_metadata:
+            return None
+        return None

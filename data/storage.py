@@ -5,6 +5,10 @@ import os
 import tempfile
 
 from astrbot.api import logger
+try:
+    from astrbot.api.platform import MessageType
+except Exception:
+    MessageType = None
 
 from .runtime_paths import get_runtime_file_path
 from .secret_store import SecretDecryptionError, SecretProtectionError, SecretProtector
@@ -16,6 +20,25 @@ DEFAULT_STORAGE_DATA = {
 
 
 class Storage:
+    PRIVATE_MESSAGE_TYPE = "FriendMessage"
+    GROUP_MESSAGE_TYPE = "GroupMessage"
+    OTHER_MESSAGE_TYPE = "OtherMessage"
+    LEGACY_PRIVATE_NOTIFY_ORIGIN_PREFIXES = (
+        "friend:",
+        "private:",
+        "direct:",
+        "dm:",
+        "user:",
+    )
+    LEGACY_PUBLIC_NOTIFY_ORIGIN_PREFIXES = (
+        "group:",
+        "channel:",
+        "guild:",
+        "room:",
+        "chatroom:",
+        "discussion:",
+    )
+
     def __init__(self, filepath=None):
         if filepath is None:
             filepath = get_runtime_file_path("df_red_data.json")
@@ -42,6 +65,130 @@ class Storage:
         if origin is None:
             return ""
         return str(origin).strip()
+
+    @classmethod
+    def _normalize_message_type(cls, message_type):
+        normalized_message_type = cls._normalize_group_origin(message_type)
+        if not normalized_message_type:
+            return ""
+
+        if MessageType is not None:
+            try:
+                return MessageType(normalized_message_type).value
+            except Exception:
+                pass
+
+        lowered_message_type = normalized_message_type.lower()
+        if lowered_message_type in {"friendmessage", "friend_message", "friend"}:
+            return cls.PRIVATE_MESSAGE_TYPE
+        if lowered_message_type in {"groupmessage", "group_message", "group"}:
+            return cls.GROUP_MESSAGE_TYPE
+        if lowered_message_type in {"othermessage", "other_message", "other"}:
+            return cls.OTHER_MESSAGE_TYPE
+        return ""
+
+    @classmethod
+    def _parse_origin(cls, origin):
+        normalized_origin = cls._normalize_group_origin(origin)
+        if not normalized_origin:
+            return None
+
+        official_parts = normalized_origin.split(":", 2)
+        if len(official_parts) == 3:
+            platform_id, message_type, session_id = official_parts
+            normalized_message_type = cls._normalize_message_type(message_type)
+            if platform_id and session_id and normalized_message_type:
+                return {
+                    "origin": normalized_origin,
+                    "platform_id": platform_id,
+                    "message_type": normalized_message_type,
+                    "session_id": session_id,
+                    "is_official": True,
+                }
+
+        legacy_parts = normalized_origin.split(":", 1)
+        if len(legacy_parts) == 2:
+            legacy_prefix, session_id = legacy_parts
+            lowered_prefix = f"{legacy_prefix.lower()}:"
+            if session_id:
+                if lowered_prefix in cls.LEGACY_PRIVATE_NOTIFY_ORIGIN_PREFIXES:
+                    return {
+                        "origin": normalized_origin,
+                        "platform_id": "",
+                        "message_type": cls.PRIVATE_MESSAGE_TYPE,
+                        "session_id": session_id,
+                        "is_official": False,
+                    }
+                if lowered_prefix in cls.LEGACY_PUBLIC_NOTIFY_ORIGIN_PREFIXES:
+                    return {
+                        "origin": normalized_origin,
+                        "platform_id": "",
+                        "message_type": cls.GROUP_MESSAGE_TYPE,
+                        "session_id": session_id,
+                        "is_official": False,
+                    }
+
+        return None
+
+    @classmethod
+    def sanitize_private_notify_origin(cls, origin, *, sender_id=""):
+        parsed_origin = cls._parse_origin(origin)
+        if not parsed_origin:
+            return ""
+        if parsed_origin["message_type"] == cls.PRIVATE_MESSAGE_TYPE:
+            return parsed_origin["origin"]
+        return ""
+
+    @classmethod
+    def normalize_interaction_origin(cls, origin, *, sender_id=""):
+        parsed_origin = cls._parse_origin(origin)
+        if parsed_origin:
+            return parsed_origin["origin"]
+        return ""
+
+    @classmethod
+    def extract_platform_id(cls, origin):
+        parsed_origin = cls._parse_origin(origin)
+        if not parsed_origin:
+            return ""
+        return parsed_origin["platform_id"]
+
+    @classmethod
+    def build_private_origin(cls, platform_id, session_id):
+        normalized_platform_id = cls._normalize_group_origin(platform_id)
+        normalized_session_id = cls._normalize_group_origin(session_id)
+        if not normalized_platform_id or not normalized_session_id:
+            return ""
+        return (
+            f"{normalized_platform_id}:"
+            f"{cls.PRIVATE_MESSAGE_TYPE}:"
+            f"{normalized_session_id}"
+        )
+
+    @classmethod
+    def derive_private_origin(cls, sender_id, *, primary_origin="", fallback_origin=""):
+        normalized_sender_id = cls._normalize_group_origin(sender_id)
+        if not normalized_sender_id:
+            return ""
+
+        for candidate_origin in (primary_origin, fallback_origin):
+            safe_origin = cls.sanitize_private_notify_origin(
+                candidate_origin,
+                sender_id=normalized_sender_id,
+            )
+            if safe_origin:
+                return safe_origin
+
+            platform_id = cls.extract_platform_id(candidate_origin)
+            if platform_id:
+                derived_origin = cls.build_private_origin(
+                    platform_id,
+                    normalized_sender_id,
+                )
+                if derived_origin:
+                    return derived_origin
+
+        return ""
 
     def _load_from_disk(self):
         data = copy.deepcopy(DEFAULT_STORAGE_DATA)
@@ -78,7 +225,10 @@ class Storage:
             for sender_id, user_data in users.items():
                 if not isinstance(user_data, dict):
                     continue
-                normalized_user, migrated = self._normalize_user_record(copy.deepcopy(user_data))
+                normalized_user, migrated = self._normalize_user_record(
+                    copy.deepcopy(user_data),
+                    sender_id=str(sender_id),
+                )
                 normalized_users[str(sender_id)] = normalized_user
                 needs_migration = needs_migration or migrated
             data["users"] = normalized_users
@@ -87,9 +237,34 @@ class Storage:
 
         return data, needs_migration
 
-    def _normalize_user_record(self, user_data):
+    def _normalize_user_record(self, user_data, *, sender_id=""):
         migrated = False
         normalized = copy.deepcopy(user_data)
+        original_notify_origin = self._normalize_group_origin(normalized.get("notify_origin", ""))
+        original_interaction_origin = self._normalize_group_origin(
+            normalized.get("interaction_origin", "")
+        )
+        normalized_notify_origin = self.sanitize_private_notify_origin(
+            original_notify_origin,
+            sender_id=sender_id,
+        )
+        normalized_interaction_origin = self.normalize_interaction_origin(
+            original_interaction_origin or original_notify_origin,
+            sender_id=sender_id,
+        )
+        if normalized_notify_origin:
+            normalized["notify_origin"] = normalized_notify_origin
+        else:
+            normalized.pop("notify_origin", None)
+        if normalized_interaction_origin:
+            normalized["interaction_origin"] = normalized_interaction_origin
+        else:
+            normalized.pop("interaction_origin", None)
+        if (
+            original_notify_origin != normalized_notify_origin
+            or original_interaction_origin != normalized_interaction_origin
+        ):
+            migrated = True
 
         secret_updates = {}
         try:
@@ -216,7 +391,17 @@ class Storage:
         if new_data is not None:
             self.data = snapshot
 
-    async def add_user(self, sender_id, openid, access_token, name="", platform="qq", role_id=""):
+    async def add_user(
+        self,
+        sender_id,
+        openid,
+        access_token,
+        name="",
+        platform="qq",
+        role_id="",
+        notify_origin="",
+        interaction_origin="",
+    ):
         sender_id = self._normalize_sender_id(sender_id)
         async with self._lock:
             new_data = copy.deepcopy(self.data)
@@ -227,12 +412,26 @@ class Storage:
                 "name": name,
                 "platform": platform,
                 "role_id": role_id,
+                "binding_status": "active",
+                "binding_status_reason": "",
                 "last_match_time": "",
                 "last_room_id": "",
                 "last_item_flow_keys": [],
                 "pending_broadcasts": [],
                 "assets": [],
             }
+            normalized_notify_origin = self.sanitize_private_notify_origin(
+                notify_origin,
+                sender_id=sender_id,
+            )
+            normalized_interaction_origin = self.normalize_interaction_origin(
+                interaction_origin or notify_origin,
+                sender_id=sender_id,
+            )
+            if normalized_notify_origin:
+                user_state["notify_origin"] = normalized_notify_origin
+            if normalized_interaction_origin:
+                user_state["interaction_origin"] = normalized_interaction_origin
             self._set_user_secrets(user_state, openid=openid, access_token=access_token)
             users[sender_id] = user_state
             await self._persist_locked(new_data)
@@ -305,6 +504,24 @@ class Storage:
             user_data = new_data["users"].get(sender_id)
             openid = fields.pop("openid", None) if "openid" in fields else None
             access_token = fields.pop("access_token", None) if "access_token" in fields else None
+            if "notify_origin" in fields:
+                normalized_notify_origin = self.sanitize_private_notify_origin(
+                    fields.pop("notify_origin"),
+                    sender_id=sender_id,
+                )
+                if normalized_notify_origin:
+                    user_data["notify_origin"] = normalized_notify_origin
+                else:
+                    user_data.pop("notify_origin", None)
+            if "interaction_origin" in fields:
+                normalized_interaction_origin = self.normalize_interaction_origin(
+                    fields.pop("interaction_origin"),
+                    sender_id=sender_id,
+                )
+                if normalized_interaction_origin:
+                    user_data["interaction_origin"] = normalized_interaction_origin
+                else:
+                    user_data.pop("interaction_origin", None)
             user_data.update(copy.deepcopy(fields))
             self._set_user_secrets(user_data, openid=openid, access_token=access_token)
             await self._persist_locked(new_data)

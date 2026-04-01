@@ -19,6 +19,10 @@ MAX_PARALLEL_USER_CHECKS = 4
 MAX_PARALLEL_BROADCASTS = 4
 CHECK_USER_TIMEOUT_SECONDS = 45
 MAX_PENDING_BROADCASTS = 20
+ITEM_CATALOG_UNAVAILABLE_ERROR = "未获取到物品目录，请稍后重试或先执行 df刷新物品缓存。"
+TRANSIENT_FAILURE_NOTICE_THRESHOLD = 3
+NOTICE_TARGET_INTERACTION = "interaction"
+NOTICE_TARGET_ADMIN = "admin"
 
 
 class RedDetector:
@@ -29,6 +33,9 @@ class RedDetector:
         self.context = context
         self.check_counters = {}
         self.credential_error_users = set()
+        self.transient_failure_counters = {}
+        self.transient_failure_notified_users = set()
+        self.item_catalog_fallback_notified_users = set()
         self.debug_dir = Path(get_runtime_debug_dir())
         self.max_parallel_user_checks = MAX_PARALLEL_USER_CHECKS
         self.max_parallel_broadcasts = MAX_PARALLEL_BROADCASTS
@@ -47,8 +54,12 @@ class RedDetector:
         return str(self.debug_dir)
 
     def clear_user_runtime_state(self, sender_id):
-        self.check_counters.pop(str(sender_id), None)
-        self.credential_error_users.discard(str(sender_id))
+        sender_id = str(sender_id)
+        self.check_counters.pop(sender_id, None)
+        self.credential_error_users.discard(sender_id)
+        self.transient_failure_counters.pop(sender_id, None)
+        self.transient_failure_notified_users.discard(sender_id)
+        self.item_catalog_fallback_notified_users.discard(sender_id)
 
     @staticmethod
     def _normalize_origin(origin):
@@ -75,6 +86,140 @@ class RedDetector:
         if not text or text.lower() in {"none", "null", "unknown"}:
             return ""
         return text
+
+    @staticmethod
+    def _is_binding_invalid_message(message):
+        message_text = str(message or "").strip()
+        if not message_text:
+            return False
+        invalid_tokens = (
+            "鉴权",
+            "过期",
+            "重新扫码登录",
+            "cookie无效",
+            "cookie过期",
+            "登录失效",
+        )
+        lowered_message = message_text.lower()
+        return any(token in message_text for token in invalid_tokens) or any(
+            token in lowered_message for token in ("cookie invalid", "cookie expired")
+        )
+
+    @staticmethod
+    def _normalize_binding_status(value):
+        return "invalid" if str(value or "").strip().lower() == "invalid" else "active"
+
+    @staticmethod
+    def _normalize_failure_reason(message):
+        normalized = str(message or "").strip()
+        return normalized or "未获取到明确错误信息"
+
+    @classmethod
+    def _normalize_pending_notice(cls, notice):
+        if not isinstance(notice, dict):
+            return {}
+        message = cls._normalize_text_value(notice.get("message"))
+        if not message:
+            return {}
+        normalized_notice = {"message": message}
+        notice_type = cls._normalize_text_value(notice.get("type"))
+        if notice_type:
+            normalized_notice["type"] = notice_type
+        notice_target = cls._normalize_text_value(notice.get("target"))
+        if notice_target in {NOTICE_TARGET_INTERACTION, NOTICE_TARGET_ADMIN}:
+            normalized_notice["target"] = notice_target
+        return normalized_notice
+
+    @staticmethod
+    def _format_notice_subject(sender_id, user_data):
+        display_name = str(user_data.get("name", "")).strip()
+        if display_name:
+            return f"{display_name}({sender_id})"
+        return f"用户 {sender_id}"
+
+    def _get_admin_ids(self):
+        try:
+            config = self.context.get_config()
+        except Exception as exc:
+            logger.warning(
+                "Failed to load AstrBot admin config while routing pending notices: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return []
+
+        raw_admin_ids = []
+        if hasattr(config, "get"):
+            raw_admin_ids = config.get("admins_id", []) or []
+
+        if isinstance(raw_admin_ids, (str, int)):
+            raw_admin_ids = [raw_admin_ids]
+        elif not isinstance(raw_admin_ids, (list, tuple, set)):
+            return []
+
+        normalized_admin_ids = []
+        for admin_id in raw_admin_ids:
+            normalized_admin_id = self._normalize_text_value(admin_id)
+            if normalized_admin_id and normalized_admin_id not in normalized_admin_ids:
+                normalized_admin_ids.append(normalized_admin_id)
+        return normalized_admin_ids
+
+    @staticmethod
+    def _resolve_user_private_origin(sender_id, user_data):
+        interaction_origin = Storage.normalize_interaction_origin(
+            user_data.get("interaction_origin", ""),
+        )
+        private_origin = Storage.derive_private_origin(
+            sender_id,
+            primary_origin=user_data.get("notify_origin", ""),
+            fallback_origin=interaction_origin,
+        )
+        return private_origin, interaction_origin
+
+    def _resolve_admin_notice_origins(self, user_data):
+        platform_id = ""
+        for origin in (
+            user_data.get("interaction_origin", ""),
+            user_data.get("notify_origin", ""),
+        ):
+            platform_id = Storage.extract_platform_id(origin)
+            if platform_id:
+                break
+
+        if not platform_id:
+            return []
+
+        admin_origins = []
+        for admin_id in self._get_admin_ids():
+            admin_origin = Storage.build_private_origin(platform_id, admin_id)
+            if admin_origin and admin_origin not in admin_origins:
+                admin_origins.append(admin_origin)
+        return admin_origins
+
+    def _resolve_pending_notice_origins(self, sender_id, user_data, pending_notice):
+        private_origin, interaction_origin = self._resolve_user_private_origin(
+            sender_id,
+            user_data,
+        )
+        notice_target = pending_notice.get("target")
+        if notice_target == NOTICE_TARGET_ADMIN:
+            admin_origins = self._resolve_admin_notice_origins(user_data)
+            if admin_origins:
+                return admin_origins, NOTICE_TARGET_ADMIN
+
+            fallback_origin = interaction_origin or private_origin
+            if fallback_origin:
+                logger.warning(
+                    f"Falling back to non-admin notice routing for user {sender_id} "
+                    "because no official AstrBot admin private target could be resolved."
+                )
+                return [fallback_origin], f"{NOTICE_TARGET_ADMIN}_fallback"
+            return [], NOTICE_TARGET_ADMIN
+
+        if notice_target == NOTICE_TARGET_INTERACTION:
+            target_origin = interaction_origin or private_origin
+            return ([target_origin], NOTICE_TARGET_INTERACTION) if target_origin else ([], NOTICE_TARGET_INTERACTION)
+
+        return ([private_origin], "private") if private_origin else ([], "private")
 
     @classmethod
     def _normalize_pending_broadcasts(cls, pending_broadcasts):
@@ -220,6 +365,35 @@ class RedDetector:
         return ""
 
     @staticmethod
+    def _coerce_dict_list(value, *, label):
+        if not isinstance(value, list):
+            if value not in (None, "", {}):
+                logger.warning(
+                    f"Expected {label} to be a list, got {type(value).__name__}."
+                )
+            return []
+
+        normalized = [item for item in value if isinstance(item, dict)]
+        if len(normalized) != len(value):
+            logger.warning(
+                f"Dropped {len(value) - len(normalized)} non-dict entries from {label}."
+            )
+        return normalized
+
+    async def _fetch_latest_match(self, openid, access_token, platform="qq"):
+        for label, fetcher in (
+            ("records_v2", self.api.fetch_records_v2),
+            ("records", self.api.fetch_records),
+        ):
+            records = self._coerce_dict_list(
+                await fetcher(openid, access_token, type_id=4, platform=platform),
+                label=label,
+            )
+            if records:
+                return records[0]
+        return None
+
+    @staticmethod
     def _format_item_names(detected_items, limit=3):
         names = [
             str(item.get("name", "")).strip()
@@ -232,16 +406,289 @@ class RedDetector:
             return "、".join(names)
         return f"{'、'.join(names[:limit])} 等 {len(names)} 件物品"
 
+    async def _persist_role_id_hint(self, sender_id, user_data, role_id):
+        role_id = str(role_id or "").strip()
+        if not role_id:
+            return ""
+        if str(user_data.get("role_id", "")).strip() == role_id:
+            user_data["role_id"] = role_id
+            return role_id
+
+        try:
+            await self.storage.update_user_state(sender_id, role_id=role_id)
+        except OSError as exc:
+            logger.warning(
+                f"Failed to persist role_id for sender {sender_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        user_data["role_id"] = role_id
+        return role_id
+
+    async def _queue_pending_notice(self, sender_id, user_data, notice_type, message, target=None):
+        pending_notice = {
+            "type": str(notice_type or "").strip() or "generic",
+            "message": str(message or "").strip(),
+        }
+        normalized_target = str(target or "").strip()
+        if normalized_target in {NOTICE_TARGET_INTERACTION, NOTICE_TARGET_ADMIN}:
+            pending_notice["target"] = normalized_target
+        normalized_pending_notice = self._normalize_pending_notice(pending_notice)
+        if not normalized_pending_notice:
+            return False
+
+        current_notice = self._normalize_pending_notice(user_data.get("pending_notice"))
+        if current_notice == normalized_pending_notice:
+            return False
+
+        try:
+            await self.storage.update_user_state(
+                sender_id,
+                pending_notice=normalized_pending_notice,
+            )
+        except OSError as exc:
+            logger.warning(
+                f"Failed to persist pending notice for user {sender_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        user_data["pending_notice"] = normalized_pending_notice
+        return True
+
+    async def _flush_pending_notice(self, sender_id, user_data):
+        pending_notice = self._normalize_pending_notice(user_data.get("pending_notice"))
+        if not pending_notice:
+            return False
+
+        notify_origins, route_mode = self._resolve_pending_notice_origins(
+            sender_id,
+            user_data,
+            pending_notice,
+        )
+        if not notify_origins:
+            logger.warning(
+                f"Failed to resolve a valid notice target for user {sender_id} "
+                f"(route={route_mode})."
+            )
+            return False
+
+        successful_origins = []
+        failed_origins = []
+        for notify_origin in notify_origins:
+            try:
+                await self._send_message_to_origin(notify_origin, pending_notice["message"])
+            except Exception as exc:
+                failed_origins.append(
+                    f"{notify_origin}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            successful_origins.append(notify_origin)
+
+        if not successful_origins:
+            logger.warning(
+                f"Failed to send pending notice to user {sender_id} via "
+                f"{route_mode}: {' | '.join(failed_origins) if failed_origins else 'unknown send error'}"
+            )
+            return False
+        if failed_origins:
+            logger.warning(
+                f"Partially failed to send pending notice for user {sender_id}: "
+                f"{' | '.join(failed_origins)}"
+            )
+
+        try:
+            await self.storage.update_user_state(sender_id, pending_notice=None)
+        except OSError as exc:
+            logger.warning(
+                f"Failed to clear pending notice for user {sender_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        user_data["pending_notice"] = None
+        logger.info(
+            f"Sent pending notice to user {sender_id} via {route_mode}: "
+            f"{', '.join(successful_origins)}."
+        )
+        return True
+
+    async def _set_binding_invalid(self, sender_id, user_data, reason, notice_type, notice_message):
+        reason = str(reason or "").strip()
+        fields = {}
+        if self._normalize_binding_status(user_data.get("binding_status")) != "invalid":
+            fields["binding_status"] = "invalid"
+        if str(user_data.get("binding_status_reason", "")).strip() != reason:
+            fields["binding_status_reason"] = reason
+        if fields:
+            try:
+                await self.storage.update_user_state(sender_id, **fields)
+            except OSError as exc:
+                logger.warning(
+                    f"Failed to persist invalid binding status for user {sender_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                user_data.update(fields)
+
+        await self._queue_pending_notice(
+            sender_id,
+            user_data,
+            notice_type,
+            notice_message,
+        )
+        await self._flush_pending_notice(sender_id, user_data)
+
+    def _clear_transient_failure_state(self, sender_id):
+        sender_id = str(sender_id)
+        self.transient_failure_counters.pop(sender_id, None)
+        self.transient_failure_notified_users.discard(sender_id)
+
+    def _clear_item_catalog_fallback_state(self, sender_id):
+        self.item_catalog_fallback_notified_users.discard(str(sender_id))
+
+    async def _register_transient_failure(self, sender_id, user_data, error_message):
+        sender_id = str(sender_id)
+        normalized_error = self._normalize_failure_reason(error_message)
+        failure_count = self.transient_failure_counters.get(sender_id, 0) + 1
+        self.transient_failure_counters[sender_id] = failure_count
+
+        if failure_count < TRANSIENT_FAILURE_NOTICE_THRESHOLD:
+            return False
+        if sender_id in self.transient_failure_notified_users:
+            return False
+
+        notice_subject = self._format_notice_subject(sender_id, user_data)
+        notice_message = (
+            f"[系统告警] {notice_subject} 后台连续 {failure_count} 次获取三角洲数据失败，"
+            "但暂未判定绑定已失效。\n"
+            f"最近错误：{normalized_error}\n"
+            "系统仍会自动重试；若长时间持续，请查看日志。"
+        )
+        current_notice = self._normalize_pending_notice(user_data.get("pending_notice"))
+        queued = await self._queue_pending_notice(
+            sender_id,
+            user_data,
+            "transient_upstream_error",
+            notice_message,
+            target=NOTICE_TARGET_ADMIN,
+        )
+        if not queued:
+            expected_notice = {
+                "type": "transient_upstream_error",
+                "message": notice_message,
+                "target": NOTICE_TARGET_ADMIN,
+            }
+            if current_notice != expected_notice:
+                return False
+
+        self.transient_failure_notified_users.add(sender_id)
+        await self._flush_pending_notice(sender_id, user_data)
+        return True
+
+    async def _maybe_notify_item_catalog_fallback(self, sender_id, user_data):
+        sender_id = str(sender_id)
+        if sender_id in self.item_catalog_fallback_notified_users:
+            return False
+
+        notice_subject = self._format_notice_subject(sender_id, user_data)
+        notice_message = (
+            f"[系统告警] {notice_subject} 的物品目录自动刷新失败，"
+            "当前暂时沿用旧缓存继续检测。\n"
+            "这通常不会中断播报，但新版本物品分类可能存在延迟。\n"
+            "若持续出现，请查看日志，必要时手动执行 df刷新物品缓存。"
+        )
+        current_notice = self._normalize_pending_notice(user_data.get("pending_notice"))
+        queued = await self._queue_pending_notice(
+            sender_id,
+            user_data,
+            "item_catalog_stale_fallback",
+            notice_message,
+            target=NOTICE_TARGET_ADMIN,
+        )
+        if not queued:
+            expected_notice = {
+                "type": "item_catalog_stale_fallback",
+                "message": notice_message,
+                "target": NOTICE_TARGET_ADMIN,
+            }
+            if current_notice != expected_notice:
+                return False
+
+        self.item_catalog_fallback_notified_users.add(sender_id)
+        await self._flush_pending_notice(sender_id, user_data)
+        return True
+
+    async def _maybe_notify_invalid_binding(self, sender_id, user_data, openid, access_token, platform="qq"):
+        try:
+            bind_res = await self.api.bind_account(access_token, openid, platform)
+        except Exception as exc:
+            logger.warning(
+                f"Failed to validate binding for user {sender_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            await self._register_transient_failure(
+                sender_id,
+                user_data,
+                f"绑定状态校验异常: {type(exc).__name__}: {exc}",
+            )
+            return False
+
+        if not isinstance(bind_res, dict):
+            logger.warning(
+                f"Expected bind_account validation result to be a dict for user {sender_id}, "
+                f"got {type(bind_res).__name__}."
+            )
+            await self._register_transient_failure(
+                sender_id,
+                user_data,
+                f"绑定状态校验返回格式异常: {type(bind_res).__name__}",
+            )
+            return False
+
+        if bind_res.get("status"):
+            self._clear_transient_failure_state(sender_id)
+            role_id = str(bind_res.get("data", {}).get("role_id", "")).strip()
+            if role_id:
+                await self._persist_role_id_hint(sender_id, user_data, role_id)
+            return False
+
+        error_message = str(bind_res.get("message", "")).strip()
+        error_kind = str(bind_res.get("error_kind", "")).strip().lower()
+        if error_kind:
+            if error_kind != "credential_expired":
+                await self._register_transient_failure(
+                    sender_id,
+                    user_data,
+                    error_message or f"绑定状态校验失败({error_kind})",
+                )
+                return False
+        elif not self._is_binding_invalid_message(error_message):
+            await self._register_transient_failure(
+                sender_id,
+                user_data,
+                error_message or "绑定状态校验失败",
+            )
+            return False
+
+        self._clear_transient_failure_state(sender_id)
+        logger.warning(
+            f"Detected invalid binding for user {sender_id}: {error_message}"
+        )
+        await self._set_binding_invalid(
+            sender_id,
+            user_data,
+            error_message,
+            "binding_invalid",
+            "检测到你当前保存的三角洲绑定可能已失效，后台监测已暂停。\n"
+            "请重新执行 df绑定 以覆盖旧绑定。\n"
+            f"原因：{error_message}",
+        )
+        return True
+
     async def ensure_user_role_id(self, sender_id, user_data, match_info=None):
         role_id = str(user_data.get("role_id", "")).strip()
         if not role_id and match_info:
             role_id = self._extract_role_id(match_info)
 
         if role_id:
-            if user_data.get("role_id") != role_id:
-                await self.storage.update_user_state(sender_id, role_id=role_id)
-                user_data["role_id"] = role_id
-            return role_id
+            return await self._persist_role_id_hint(sender_id, user_data, role_id)
 
         openid = user_data.get("openid")
         access_token = user_data.get("access_token")
@@ -250,11 +697,16 @@ class RedDetector:
             return ""
 
         bind_res = await self.api.bind_account(access_token, openid, platform)
-        role_id = str(bind_res.get("data", {}).get("role_id", "")).strip()
+        bind_data = bind_res.get("data", {}) if isinstance(bind_res, dict) else {}
+        if bind_res and not isinstance(bind_res, dict):
+            logger.warning(
+                f"Expected bind_account result to be a dict for sender {sender_id}, "
+                f"got {type(bind_res).__name__}."
+            )
+        role_id = str(bind_data.get("role_id", "")).strip()
         if role_id:
-            await self.storage.update_user_state(sender_id, role_id=role_id)
-            user_data["role_id"] = role_id
-        return role_id
+            return await self._persist_role_id_hint(sender_id, user_data, role_id)
+        return ""
 
     async def _enrich_match_info(self, openid, access_token, match_info, platform="qq"):
         if not isinstance(match_info, dict):
@@ -576,8 +1028,10 @@ class RedDetector:
             return ""
         return str(match.get("roomId") or match.get("RoomId") or "")
 
-    async def _get_item_catalog_map(self, openid, access_token, platform="qq"):
-        items = await self.api.fetch_item_catalog(openid, access_token, platform=platform)
+    @staticmethod
+    def _build_item_catalog_map(items):
+        if not items:
+            return None
         info_map = {}
         for info in items:
             if not isinstance(info, dict):
@@ -585,20 +1039,42 @@ class RedDetector:
             key = str(info.get("objectID") or info.get("item_id") or info.get("id") or "")
             if key:
                 info_map[key] = info
-        return info_map
+        return info_map or None
+
+    async def _get_item_catalog_map(self, openid, access_token, platform="qq"):
+        items = await self.api.fetch_item_catalog(openid, access_token, platform=platform)
+        return self._build_item_catalog_map(items)
+
+    async def _get_item_catalog_map_with_meta(self, openid, access_token, platform="qq"):
+        result = await self.api.fetch_item_catalog(
+            openid,
+            access_token,
+            platform=platform,
+            return_metadata=True,
+        )
+        if result is None:
+            return None, {}
+        if isinstance(result, dict):
+            items = result.get("items", [])
+            metadata = {key: value for key, value in result.items() if key != "items"}
+            return self._build_item_catalog_map(items), metadata
+        return self._build_item_catalog_map(result), {}
 
     async def build_debug_report(self, openid, access_token, platform="qq"):
-        logs_v2 = await self.api.fetch_records_v2(openid, access_token, type_id=4, platform=platform)
-        latest_match = logs_v2[0] if logs_v2 else None
-        if not latest_match:
-            logs = await self.api.fetch_records(openid, access_token, type_id=4, platform=platform)
-            latest_match = logs[0] if logs else None
+        latest_match = await self._fetch_latest_match(
+            openid,
+            access_token,
+            platform=platform,
+        )
         if not latest_match:
             return {"error": "未获取到最新战绩"}
 
         current_match_time = latest_match.get("dtEventTime", "")
         current_room_id = self._extract_room_id(latest_match)
-        item_flows = await self.api.fetch_all_item_flows(openid, access_token, platform=platform)
+        item_flows = self._coerce_dict_list(
+            await self.api.fetch_all_item_flows(openid, access_token, platform=platform),
+            label="item_flows",
+        )
 
         all_carry_out_items = self._collect_reason_items(
             item_flows,
@@ -618,23 +1094,27 @@ class RedDetector:
             seconds=420,
         )
 
-        info_map = await self._get_item_catalog_map(openid, access_token, platform=platform)
         collection_candidates = []
-        for item in carry_out_items:
-            item_id = str(item.get("iGoodsId", ""))
-            info = info_map.get(item_id, {})
-            collection_candidates.append(
-                {
-                    "id": item_id,
-                    "name": item.get("Name", ""),
-                    "time": item.get("dtEventTime", ""),
-                    "change": item.get("AddOrReduce", ""),
-                    "reason": item.get("Reason", ""),
-                    "is_collection": self._is_collection_item(info),
-                    "grade": self._safe_int(info.get("grade", 0)),
-                    "category_fields": self._extract_category_fields(info),
-                }
-            )
+        if carry_out_items:
+            info_map = await self._get_item_catalog_map(openid, access_token, platform=platform)
+            if info_map is None:
+                return {"error": ITEM_CATALOG_UNAVAILABLE_ERROR}
+
+            for item in carry_out_items:
+                item_id = str(item.get("iGoodsId", ""))
+                info = info_map.get(item_id, {})
+                collection_candidates.append(
+                    {
+                        "id": item_id,
+                        "name": item.get("Name", ""),
+                        "time": item.get("dtEventTime", ""),
+                        "change": item.get("AddOrReduce", ""),
+                        "reason": item.get("Reason", ""),
+                        "is_collection": self._is_collection_item(info),
+                        "grade": self._safe_int(info.get("grade", 0)),
+                        "category_fields": self._extract_category_fields(info),
+                    }
+                )
 
         return {
             "match": {
@@ -652,16 +1132,19 @@ class RedDetector:
         }
 
     async def build_latest_broadcast_payload(self, openid, access_token, platform="qq"):
-        logs_v2 = await self.api.fetch_records_v2(openid, access_token, type_id=4, platform=platform)
-        latest_match = logs_v2[0] if logs_v2 else None
-        if not latest_match:
-            logs = await self.api.fetch_records(openid, access_token, type_id=4, platform=platform)
-            latest_match = logs[0] if logs else None
+        latest_match = await self._fetch_latest_match(
+            openid,
+            access_token,
+            platform=platform,
+        )
         if not latest_match:
             return {"error": "未获取到最近一局战绩"}
 
         current_match_time = latest_match.get("dtEventTime", "")
-        item_flows = await self.api.fetch_all_item_flows(openid, access_token, platform=platform)
+        item_flows = self._coerce_dict_list(
+            await self.api.fetch_all_item_flows(openid, access_token, platform=platform),
+            label="item_flows",
+        )
         if not item_flows:
             return {"error": "未获取到道具流水"}
 
@@ -673,22 +1156,26 @@ class RedDetector:
             seconds=420,
         )
 
-        info_map = await self._get_item_catalog_map(openid, access_token, platform=platform)
         detected_items = []
-        for item in carry_out_items:
-            item_id = str(item.get("iGoodsId", ""))
-            info = info_map.get(item_id, {})
-            if not self._is_collection_item(info):
-                continue
-            detected_items.append(
-                {
-                    "id": item_id,
-                    "name": item.get("Name") or info.get("name") or f"未知物品({item_id})",
-                    "time": item.get("dtEventTime", ""),
-                    "change": item.get("AddOrReduce", "+0"),
-                    "reason": item.get("Reason", ""),
-                }
-            )
+        if carry_out_items:
+            info_map = await self._get_item_catalog_map(openid, access_token, platform=platform)
+            if info_map is None:
+                return {"error": ITEM_CATALOG_UNAVAILABLE_ERROR}
+
+            for item in carry_out_items:
+                item_id = str(item.get("iGoodsId", ""))
+                info = info_map.get(item_id, {})
+                if not self._is_collection_item(info):
+                    continue
+                detected_items.append(
+                    {
+                        "id": item_id,
+                        "name": item.get("Name") or info.get("name") or f"未知物品({item_id})",
+                        "time": item.get("dtEventTime", ""),
+                        "change": item.get("AddOrReduce", "+0"),
+                        "reason": item.get("Reason", ""),
+                    }
+                )
 
         detected_items.sort(key=lambda item: item.get("name", ""))
         latest_match = await self._enrich_match_info(openid, access_token, latest_match, platform=platform)
@@ -749,6 +1236,8 @@ class RedDetector:
             logger.error(f"Failed to check user {sender_id}: {type(exc).__name__}: {exc}")
 
     async def _check_user_impl(self, sender_id, user_data):
+        await self._flush_pending_notice(sender_id, user_data)
+
         if self._normalize_pending_broadcasts(user_data.get("pending_broadcasts", [])):
             await self.retry_pending_broadcasts(sender_id, user_data)
 
@@ -758,8 +1247,20 @@ class RedDetector:
                     f"Skipping user {sender_id} because stored credentials could not be decrypted."
                 )
                 self.credential_error_users.add(sender_id)
+                await self._set_binding_invalid(
+                    sender_id,
+                    user_data,
+                    "已保存的账号凭证无法解密",
+                    "secret_error",
+                    "检测到你当前保存的账号凭证无法解密，后台监测已暂停。\n"
+                    "请重新执行 df绑定 以覆盖旧绑定；若仍失败，再执行 df解绑 后重试。",
+                )
             return
         self.credential_error_users.discard(sender_id)
+
+        if self._normalize_binding_status(user_data.get("binding_status")) == "invalid":
+            self._clear_transient_failure_state(sender_id)
+            return
 
         openid = user_data.get("openid")
         access_token = user_data.get("access_token")
@@ -770,27 +1271,22 @@ class RedDetector:
         counter = self.check_counters.get(sender_id, 0)
         self.check_counters[sender_id] = counter + 1
 
-        latest_match = None
-        logs_v2 = await self.api.fetch_records_v2(
+        latest_match = await self._fetch_latest_match(
             openid,
             access_token,
-            type_id=4,
             platform=platform,
         )
-        if logs_v2 and isinstance(logs_v2, list):
-            latest_match = logs_v2[0]
         if not latest_match:
-            logs = await self.api.fetch_records(
+            await self._maybe_notify_invalid_binding(
+                sender_id,
+                user_data,
                 openid,
                 access_token,
-                type_id=4,
                 platform=platform,
             )
-            if logs and isinstance(logs, list):
-                latest_match = logs[0]
-
-        if not latest_match:
             return
+
+        self._clear_transient_failure_state(sender_id)
 
         current_match_time = latest_match.get("dtEventTime", "")
         current_room_id = self._extract_room_id(latest_match)
@@ -808,10 +1304,13 @@ class RedDetector:
         if not should_check_flow:
             return
 
-        item_flows = await self.api.fetch_all_item_flows(
-            openid,
-            access_token,
-            platform=platform,
+        item_flows = self._coerce_dict_list(
+            await self.api.fetch_all_item_flows(
+                openid,
+                access_token,
+                platform=platform,
+            ),
+            label="item_flows",
         )
         if not item_flows:
             return
@@ -847,27 +1346,38 @@ class RedDetector:
             seconds=420,
         )
 
-        info_map = await self._get_item_catalog_map(
-            openid,
-            access_token,
-            platform=platform,
-        )
         detected_items = []
-        for item in carry_out_items:
-            item_id = str(item.get("iGoodsId", ""))
-            info = info_map.get(item_id, {})
-            display_name = item.get("Name") or info.get("name") or f"未知物品({item_id})"
-            if not self._is_collection_item(info):
-                continue
-            detected_items.append(
-                {
-                    "id": item_id,
-                    "name": display_name,
-                    "time": item.get("dtEventTime", ""),
-                    "change": item.get("AddOrReduce", "+0"),
-                    "reason": item.get("Reason", ""),
-                }
+        if carry_out_items:
+            info_map, catalog_meta = await self._get_item_catalog_map_with_meta(
+                openid,
+                access_token,
+                platform=platform,
             )
+            if info_map is None:
+                logger.warning(
+                    f"Skipping collection detection for user {sender_id} because the item catalog is unavailable."
+                )
+                return
+            if catalog_meta.get("used_stale_cache"):
+                await self._maybe_notify_item_catalog_fallback(sender_id, user_data)
+            else:
+                self._clear_item_catalog_fallback_state(sender_id)
+
+            for item in carry_out_items:
+                item_id = str(item.get("iGoodsId", ""))
+                info = info_map.get(item_id, {})
+                display_name = item.get("Name") or info.get("name") or f"未知物品({item_id})"
+                if not self._is_collection_item(info):
+                    continue
+                detected_items.append(
+                    {
+                        "id": item_id,
+                        "name": display_name,
+                        "time": item.get("dtEventTime", ""),
+                        "change": item.get("AddOrReduce", "+0"),
+                        "reason": item.get("Reason", ""),
+                    }
+                )
 
         detected_items.sort(key=lambda item: item.get("name", ""))
         update_fields = {
