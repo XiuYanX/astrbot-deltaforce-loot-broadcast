@@ -242,6 +242,21 @@ class GameAPI:
         return xlogin_url
 
     @classmethod
+    def _extract_qq_connect_authorize_need_login(cls, payload):
+        payload_text = str(payload or "")
+        if not payload_text:
+            return None
+
+        match = re.search(
+            r"Q\.isNeedLogin\s*=\s*(true|false)\s*;",
+            payload_text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return match.group(1).lower() == "true"
+
+    @classmethod
     def _merge_qq_login_config_from_url(cls, config, url):
         merged = dict(config or {})
         parsed_url = urlparse(str(url or ""))
@@ -743,6 +758,19 @@ class GameAPI:
         cookies = self._merge_cookies(authorize_cookies, xlogin_response.get("cookies", {}))
         login_config = self._extract_qq_login_config_from_xlogin_page(xlogin_result)
         login_config = self._merge_qq_login_config_from_url(login_config, xlogin_url)
+        authorize_page_url = self._normalize_message_text(response.get("url"))
+        parsed_authorize_page_url = urlparse(authorize_page_url)
+        if (
+            authorize_page_url
+            and parsed_authorize_page_url.scheme == "https"
+            and (parsed_authorize_page_url.hostname or "").lower() == "graph.qq.com"
+            and parsed_authorize_page_url.path == "/oauth2.0/show"
+        ):
+            login_config["authorize_url"] = authorize_page_url
+
+        authorize_need_login = self._extract_qq_connect_authorize_need_login(result)
+        if authorize_need_login is not None:
+            login_config["authorize_need_login"] = authorize_need_login
         login_sig = (
             self._normalize_message_text(login_config.get("login_sig"))
             or cookies.get("pt_login_sig", "")
@@ -955,24 +983,57 @@ class GameAPI:
         if not cookies:
             return {"status": False, "message": "Cookie无效，请重新扫码登录", "data": {}}
 
-        normalized_login_config = self._normalize_qq_login_config(login_config)
-        authorize_params = self._build_qq_connect_authorize_show_params()
-        try:
-            authorize_page_response, _ = await self._request_get_with_allowed_redirects(
-                QQ_CONNECT_AUTHORIZE_URL,
-                params=authorize_params,
-                headers=self._get_headers(),
-                cookies=cookies,
-                error_context="Failed to prepare QQ authorize page",
-            )
-        except REQUEST_EXCEPTIONS:
-            return {"status": False, "message": "获取access token失败", "data": {}}
-
-        merged_cookies = self._merge_cookies(cookies, authorize_page_response["cookies"])
-        authorize_page_url = (
-            self._normalize_message_text(authorize_page_response.get("url"))
-            or f"{QQ_CONNECT_AUTHORIZE_URL}?{urlencode(authorize_params)}"
+        raw_login_config = login_config if isinstance(login_config, dict) else {}
+        authorize_page_url = self._normalize_message_text(
+            raw_login_config.get("authorize_url") or raw_login_config.get("authorizeUrl")
         )
+        parsed_authorize_page_url = urlparse(authorize_page_url)
+        if not (
+            authorize_page_url
+            and parsed_authorize_page_url.scheme == "https"
+            and (parsed_authorize_page_url.hostname or "").lower() == "graph.qq.com"
+            and parsed_authorize_page_url.path == "/oauth2.0/show"
+            and self._is_allowed_redirect_target(authorize_page_url)
+        ):
+            authorize_page_url = ""
+
+        authorize_need_login = raw_login_config.get("authorize_need_login")
+        if isinstance(authorize_need_login, str):
+            lowered_authorize_need_login = authorize_need_login.strip().lower()
+            if lowered_authorize_need_login in {"true", "1", "yes"}:
+                authorize_need_login = True
+            elif lowered_authorize_need_login in {"false", "0", "no"}:
+                authorize_need_login = False
+            else:
+                authorize_need_login = None
+        elif isinstance(authorize_need_login, (int, float)):
+            authorize_need_login = bool(authorize_need_login)
+        elif not isinstance(authorize_need_login, bool):
+            authorize_need_login = None
+
+        merged_cookies = dict(cookies)
+        if not authorize_page_url:
+            authorize_params = self._build_qq_connect_authorize_show_params()
+            try:
+                authorize_page_response, authorize_page_text = await self._request_get_with_allowed_redirects(
+                    QQ_CONNECT_AUTHORIZE_URL,
+                    params=authorize_params,
+                    headers=self._get_headers(),
+                    cookies=cookies,
+                    error_context="Failed to prepare QQ authorize page",
+                )
+            except REQUEST_EXCEPTIONS:
+                return {"status": False, "message": "获取access token失败", "data": {}}
+
+            merged_cookies = self._merge_cookies(cookies, authorize_page_response["cookies"])
+            authorize_page_url = (
+                self._normalize_message_text(authorize_page_response.get("url"))
+                or f"{QQ_CONNECT_AUTHORIZE_URL}?{urlencode(authorize_params)}"
+            )
+            if authorize_need_login is None:
+                authorize_need_login = self._extract_qq_connect_authorize_need_login(
+                    authorize_page_text
+                )
         authorize_query = parse_qs(urlparse(authorize_page_url).query)
 
         def _query_value(name, default=""):
@@ -980,6 +1041,7 @@ class GameAPI:
 
         headers = {
             "Referer": authorize_page_url,
+            "Origin": "https://graph.qq.com",
             "Content-Type": "application/x-www-form-urlencoded",
             "X-G-TK": str(self._get_gtk(cookies.get("p_skey", ""))),
         }
@@ -995,7 +1057,7 @@ class GameAPI:
             "switch": _query_value("switch", ""),
             "from_ptlogin": 1,
             "src": int(_query_value("src", "1") or 1),
-            "update_auth": 1,
+            "update_auth": 1 if authorize_need_login is not False else 0,
             "openapi": "1010",
             "g_tk": self._get_gtk(cookies.get("p_skey", "")),
             "auth_time": int(time.time() * 1000),
