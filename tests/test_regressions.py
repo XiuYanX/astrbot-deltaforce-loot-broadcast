@@ -738,15 +738,29 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
         request_mock = mock.AsyncMock(
             return_value=(
                 {
-                    "status": 302,
-                    "headers": {"Location": "https://evil.example/callback?code=abc"},
+                    "status": 200,
+                    "headers": {},
+                    "cookies": {},
+                },
+                '{"ret":0,"callback":"https://evil.example/callback?code=abc"}',
+            )
+        )
+        authorize_page_mock = mock.AsyncMock(
+            return_value=(
+                {
+                    "status": 200,
+                    "url": "https://graph.qq.com/oauth2.0/show?which=Login&client_id=101491592&response_type=code&scope=get_user_info&state=STATE&src=1&redirect_uri=https%3A%2F%2Fmilo.qq.com%2Fcomm-htdocs%2Flogin%2Fqc_redirect.html%3Fparent_domain%3Dhttps%3A%2F%2Fdf.qq.com%26isMiloSDK%3D1%26isPc%3D1",
+                    "headers": {},
                     "cookies": {},
                 },
                 "",
             )
         )
 
-        with mock.patch.object(api, "_request_text", request_mock):
+        with (
+            mock.patch.object(api, "_request_text", request_mock),
+            mock.patch.object(api, "_request_get_with_allowed_redirects", authorize_page_mock),
+        ):
             result = await api.get_access_token_by_cookie({"p_skey": "token"})
 
         self.assertFalse(result["status"])
@@ -754,28 +768,34 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_access_token_exchange_follows_intermediate_redirect_before_extracting_code(self):
         api = GameAPI()
-        login_config = {
-            "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
-        }
         request_mock = mock.AsyncMock(
             side_effect=[
                 (
                     {
-                        "status": 302,
-                        "headers": {
-                            "Location": "https://ssl.ptlogin2.graph.qq.com/check_sig?pttype=1"
-                        },
+                        "status": 200,
+                        "headers": {},
                         "cookies": {"pt4_token": "token-1"},
                     },
-                    "",
+                    '{"ret":0,"callback":"https://ssl.ptlogin2.graph.qq.com/check_sig?pttype=1"}',
                 ),
                 (
                     {
-                        "status": 302,
-                        "headers": {
-                            "Location": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html?code=abc123"
-                        },
-                        "cookies": {"pt_open": "value-1"},
+                        "status": 200,
+                        "headers": {},
+                        "cookies": {},
+                    },
+                    'try{miloJsonpCb_86690({"iRet":0,"access_token":"token-ok","expires_in":"7776000","openid":"openid-ok"});}catch(e){}',
+                ),
+            ]
+        )
+        redirect_mock = mock.AsyncMock(
+            side_effect=[
+                (
+                    {
+                        "status": 200,
+                        "url": "https://graph.qq.com/oauth2.0/show?which=Login&display=pc&client_id=101491592&src=1&state=STATE&response_type=code&scope=get_user_info&redirect_uri=https%3A%2F%2Fmilo.qq.com%2Fcomm-htdocs%2Flogin%2Fqc_redirect.html%3Fparent_domain%3Dhttps%3A%2F%2Fdf.qq.com%26isMiloSDK%3D1%26isPc%3D1",
+                        "headers": {},
+                        "cookies": {"graph_key": "graph-1"},
                     },
                     "",
                 ),
@@ -788,75 +808,99 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
                     },
                     "",
                 ),
-                (
-                    {
-                        "status": 200,
-                        "headers": {},
-                        "cookies": {},
-                    },
-                    'try{miloJsonpCb_86690({"iRet":0,"access_token":"token-ok","expires_in":"7776000","openid":"openid-ok"});}catch(e){}',
-                ),
             ]
         )
 
-        with mock.patch.object(api, "_request_text", request_mock):
+        with (
+            mock.patch.object(api, "_request_text", request_mock),
+            mock.patch.object(api, "_request_get_with_allowed_redirects", redirect_mock),
+        ):
             result = await api.get_access_token_by_cookie(
                 {"p_skey": "token"},
-                login_config,
             )
 
         self.assertTrue(result["status"])
         self.assertEqual(result["data"]["access_token"], "token-ok")
         self.assertEqual(result["data"]["openid"], "openid-ok")
-        self.assertEqual(request_mock.await_count, 4)
+        self.assertEqual(request_mock.await_count, 2)
         self.assertEqual(
             request_mock.await_args_list[0].kwargs["headers"]["Referer"],
-            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+            "https://graph.qq.com/oauth2.0/show?which=Login&display=pc&client_id=101491592&src=1&state=STATE&response_type=code&scope=get_user_info&redirect_uri=https%3A%2F%2Fmilo.qq.com%2Fcomm-htdocs%2Flogin%2Fqc_redirect.html%3Fparent_domain%3Dhttps%3A%2F%2Fdf.qq.com%26isMiloSDK%3D1%26isPc%3D1",
         )
         self.assertEqual(
-            request_mock.await_args_list[3].kwargs["params"]["qc_code"],
+            request_mock.await_args_list[0].kwargs["data"]["scope"],
+            "get_user_info",
+        )
+        self.assertEqual(
+            request_mock.await_args_list[0].kwargs["data"]["from_ptlogin"],
+            1,
+        )
+        self.assertGreaterEqual(
+            request_mock.await_args_list[0].kwargs["data"]["auth_time"],
+            10**12,
+        )
+        self.assertEqual(
+            request_mock.await_args_list[1].kwargs["params"]["qc_code"],
             "abc123",
         )
 
     async def test_access_token_exchange_rejects_untrusted_second_hop_redirect_host(self):
         api = GameAPI()
         request_mock = mock.AsyncMock(
+            return_value=(
+                {
+                    "status": 200,
+                    "headers": {},
+                    "cookies": {},
+                },
+                '{"ret":0,"callback":"https://ssl.ptlogin2.graph.qq.com/check_sig?pttype=1"}',
+            )
+        )
+        redirect_mock = mock.AsyncMock(
             side_effect=[
                 (
                     {
-                        "status": 302,
-                        "headers": {"Location": "https://milo.qq.com/callback?code=abc"},
+                        "status": 200,
+                        "url": "https://graph.qq.com/oauth2.0/show?which=Login&client_id=101491592&response_type=code&scope=get_user_info&state=STATE&src=1&redirect_uri=https%3A%2F%2Fmilo.qq.com%2Fcomm-htdocs%2Flogin%2Fqc_redirect.html%3Fparent_domain%3Dhttps%3A%2F%2Fdf.qq.com%26isMiloSDK%3D1%26isPc%3D1",
+                        "headers": {},
                         "cookies": {},
                     },
                     "",
                 ),
-                (
-                    {
-                        "status": 302,
-                        "headers": {"Location": "https://evil.example/callback?code=abc"},
-                        "cookies": {},
-                    },
-                    "",
-                ),
+                game_api_module.aiohttp.ClientError("Blocked redirect target: https://evil.example/callback?code=abc"),
             ]
         )
 
-        with mock.patch.object(api, "_request_text", request_mock):
+        with (
+            mock.patch.object(api, "_request_text", request_mock),
+            mock.patch.object(api, "_request_get_with_allowed_redirects", redirect_mock),
+        ):
             result = await api.get_access_token_by_cookie({"p_skey": "token"})
 
         self.assertFalse(result["status"])
-        self.assertEqual(request_mock.await_count, 2)
+        self.assertEqual(request_mock.await_count, 1)
 
     async def test_access_token_exchange_reports_missing_auth_code_after_redirect_chain(self):
         api = GameAPI()
         request_mock = mock.AsyncMock(
+            return_value=(
+                {
+                    "status": 302,
+                    "headers": {
+                        "Location": "https://graph.qq.com/oauth2.0/show?which=Login&display=pc&client_id=101491592"
+                    },
+                    "cookies": {},
+                },
+                "",
+            )
+        )
+        redirect_mock = mock.AsyncMock(
             side_effect=[
                 (
                     {
-                        "status": 302,
-                        "headers": {
-                            "Location": "https://ssl.ptlogin2.graph.qq.com/check_sig?pttype=1"
-                        },
+                        "status": 200,
+                        "url": "https://graph.qq.com/oauth2.0/show?which=Login&display=pc&client_id=101491592&response_type=code&scope=get_user_info&state=STATE&src=1&redirect_uri=https%3A%2F%2Fmilo.qq.com%2Fcomm-htdocs%2Flogin%2Fqc_redirect.html%3Fparent_domain%3Dhttps%3A%2F%2Fdf.qq.com%26isMiloSDK%3D1%26isPc%3D1",
+                        "headers": {},
                         "cookies": {},
                     },
                     "",
@@ -864,7 +908,7 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
                 (
                     {
                         "status": 200,
-                        "url": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html",
+                        "url": "https://graph.qq.com/oauth2.0/show?which=Login&display=pc&client_id=101491592",
                         "headers": {},
                         "cookies": {},
                     },
@@ -873,12 +917,15 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with mock.patch.object(api, "_request_text", request_mock):
+        with (
+            mock.patch.object(api, "_request_text", request_mock),
+            mock.patch.object(api, "_request_get_with_allowed_redirects", redirect_mock),
+        ):
             result = await api.get_access_token_by_cookie({"p_skey": "token"})
 
         self.assertFalse(result["status"])
         self.assertEqual(result["message"], "未获取到授权码，请重新扫码登录")
-        self.assertEqual(request_mock.await_count, 2)
+        self.assertEqual(request_mock.await_count, 1)
 
     async def test_access_token_exchange_does_not_swallow_value_error(self):
         api = GameAPI()

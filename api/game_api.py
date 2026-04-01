@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
@@ -198,6 +199,21 @@ class GameAPI:
         }
 
     @classmethod
+    def _build_qq_connect_authorize_show_params(cls):
+        params = cls._build_qq_connect_authorize_params()
+        params.update(
+            {
+                "src": "1",
+                "auth_time": str(int(time.time() * 1000)),
+                "which": "Login",
+            }
+        )
+        params["redirect_uri"] = (
+            f"{QQ_CONNECT_REDIRECT_URI}?parent_domain=https://df.qq.com&isMiloSDK=1&isPc=1"
+        )
+        return params
+
+    @classmethod
     def _extract_qq_connect_xlogin_url_from_authorize_page(cls, payload):
         payload_text = str(payload or "")
         if not payload_text:
@@ -251,6 +267,27 @@ class GameAPI:
         if str(url or "").strip():
             merged["href"] = str(url)
         return merged
+
+    @staticmethod
+    def _parse_authorize_payload(payload):
+        payload_text = str(payload or "").strip()
+        if not payload_text:
+            return {}
+        try:
+            parsed = json.loads(payload_text)
+        except Exception:
+            parsed = None
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _extract_authorize_callback_url(cls, response, payload):
+        response_snapshot = response if isinstance(response, dict) else {}
+        payload_dict = cls._parse_authorize_payload(payload)
+        callback = cls._normalize_message_text(payload_dict.get("callback"))
+        if callback:
+            return callback, payload_dict
+        location = cls._normalize_message_text(response_snapshot.get("headers", {}).get("Location", ""))
+        return location, payload_dict
 
     @classmethod
     def _extract_response_message(cls, payload):
@@ -919,43 +956,71 @@ class GameAPI:
             return {"status": False, "message": "Cookie无效，请重新扫码登录", "data": {}}
 
         normalized_login_config = self._normalize_qq_login_config(login_config)
+        authorize_params = self._build_qq_connect_authorize_show_params()
+        try:
+            authorize_page_response, _ = await self._request_get_with_allowed_redirects(
+                QQ_CONNECT_AUTHORIZE_URL,
+                params=authorize_params,
+                headers=self._get_headers(),
+                cookies=cookies,
+                error_context="Failed to prepare QQ authorize page",
+            )
+        except REQUEST_EXCEPTIONS:
+            return {"status": False, "message": "获取access token失败", "data": {}}
+
+        merged_cookies = self._merge_cookies(cookies, authorize_page_response["cookies"])
+        authorize_page_url = (
+            self._normalize_message_text(authorize_page_response.get("url"))
+            or f"{QQ_CONNECT_AUTHORIZE_URL}?{urlencode(authorize_params)}"
+        )
+        authorize_query = parse_qs(urlparse(authorize_page_url).query)
+
+        def _query_value(name, default=""):
+            return self._normalize_message_text((authorize_query.get(name) or [default])[0]) or default
+
         headers = {
-            "Referer": self._build_qq_login_headers(normalized_login_config)["Referer"],
+            "Referer": authorize_page_url,
             "Content-Type": "application/x-www-form-urlencoded",
             "X-G-TK": str(self._get_gtk(cookies.get("p_skey", ""))),
         }
         form_data = {
-            "response_type": "code",
-            "client_id": str(APPID),
-            "redirect_uri": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html?parent_domain=https://df.qq.com&isMiloSDK=1&isPc=1",
-            "scope": "",
-            "state": "STATE",
-            "switch": "",
-            "form_plogin": 1,
-            "src": 1,
+            "response_type": _query_value("response_type", "code"),
+            "client_id": _query_value("client_id", str(APPID)),
+            "redirect_uri": _query_value(
+                "redirect_uri",
+                f"{QQ_CONNECT_REDIRECT_URI}?parent_domain=https://df.qq.com&isMiloSDK=1&isPc=1",
+            ),
+            "scope": _query_value("scope", QQ_CONNECT_SCOPE),
+            "state": _query_value("state", QQ_CONNECT_STATE),
+            "switch": _query_value("switch", ""),
+            "from_ptlogin": 1,
+            "src": int(_query_value("src", "1") or 1),
             "update_auth": 1,
-            "openapi": 1010,
+            "openapi": "1010",
             "g_tk": self._get_gtk(cookies.get("p_skey", "")),
-            "auth_time": int(time.time()),
-            "ui": "979D48F3-6CE2-4E95-A789-3BD3187648B6",
+            "auth_time": int(time.time() * 1000),
+            "ui": str(uuid.uuid4()).upper(),
         }
 
         try:
-            response, _ = await self._request_text(
+            response, response_text = await self._request_text(
                 "POST",
                 "https://graph.qq.com/oauth2.0/authorize",
                 data=form_data,
                 headers=headers,
-                cookies=cookies,
+                cookies=merged_cookies,
                 allow_redirects=False,
                 error_context="Failed to start QQ access token exchange",
             )
         except REQUEST_EXCEPTIONS:
             return {"status": False, "message": "获取access token失败", "data": {}}
 
-        location = response["headers"].get("Location", "")
+        location, payload_dict = self._extract_authorize_callback_url(response, response_text)
         auth_code = self._extract_query_param(location, "code")
-        merged_cookies = self._merge_cookies(cookies, response["cookies"])
+        if "ret" in payload_dict and str(payload_dict.get("ret")) != "0":
+            message = self._extract_response_message(payload_dict) or "获取access token失败"
+            return {"status": False, "message": message, "data": {}}
+        merged_cookies = self._merge_cookies(merged_cookies, response["cookies"])
         if location and not self._is_allowed_redirect_target(location):
             logger.warning(
                 "Rejected unexpected QQ authorize redirect target while exchanging access token: "
