@@ -443,6 +443,52 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    def test_extract_qq_login_config_from_xlogin_page(self):
+        payload = (
+            'pt.ptui={'
+            's_url:"https\\x3A\\x2F\\x2Fgraph.qq.com\\x2Foauth2.0\\x2Flogin_jump",'
+            'href:"https\\x3A\\x2F\\x2Fxui.ptlogin2.qq.com\\x2Fcgi-bin\\x2Fxlogin\\x3Fappid\\x3D716027609",'
+            'login_sig:"",'
+            'ptui_version:encodeURIComponent("26030415"),'
+            'appid:encodeURIComponent("716027609"),'
+            'lang:encodeURIComponent("2052"),'
+            'style:encodeURIComponent("40"),'
+            'pt_3rd_aid:encodeURIComponent("0"),'
+            'daid:encodeURIComponent(""),'
+            'target:isNaN(parseInt("1"))'
+            "};"
+        )
+
+        result = GameAPI._extract_qq_login_config_from_xlogin_page(payload)
+
+        self.assertEqual(result["appid"], "716027609")
+        self.assertEqual(result["s_url"], "https://graph.qq.com/oauth2.0/login_jump")
+        self.assertEqual(
+            result["href"],
+            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+        )
+        self.assertEqual(result["ptui_version"], "26030415")
+        self.assertEqual(result["target"], "1")
+
+    def test_decode_response_bytes_falls_back_from_utf8_to_gb18030(self):
+        class _DummyResponse:
+            charset = "utf-8"
+            headers = {"Content-Type": "text/plain"}
+
+        result = GameAPI._decode_response_bytes(
+            _DummyResponse(),
+            "测试消息".encode("gb18030"),
+        )
+
+        self.assertEqual(result, "测试消息")
+
+    def test_allowed_redirect_target_accepts_ssl_ptlogin2_graph_domain(self):
+        self.assertTrue(
+            GameAPI._is_allowed_redirect_target(
+                "https://ssl.ptlogin2.graph.qq.com/check_sig?pttype=1"
+            )
+        )
+
     async def test_get_login_token_returns_cookie_payload(self):
         api = GameAPI()
         with mock.patch.object(
@@ -455,7 +501,20 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
                         "headers": {},
                         "cookies": {"pt_login_sig": "sig-1", "foo": "bar"},
                     },
-                    "",
+                    (
+                        'pt.ptui={'
+                        's_url:"https\\x3A\\x2F\\x2Fgraph.qq.com\\x2Foauth2.0\\x2Flogin_jump",'
+                        'href:"https\\x3A\\x2F\\x2Fxui.ptlogin2.qq.com\\x2Fcgi-bin\\x2Fxlogin\\x3Fappid\\x3D716027609",'
+                        'login_sig:"",'
+                        'ptui_version:encodeURIComponent("26030415"),'
+                        'appid:encodeURIComponent("716027609"),'
+                        'lang:encodeURIComponent("2052"),'
+                        'style:encodeURIComponent("40"),'
+                        'pt_3rd_aid:encodeURIComponent("0"),'
+                        'daid:encodeURIComponent(""),'
+                        'target:isNaN(parseInt("1"))'
+                        "};"
+                    ),
                 )
             ),
         ):
@@ -467,6 +526,18 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
             {
                 "cookie": {"pt_login_sig": "sig-1", "foo": "bar"},
                 "loginSig": "sig-1",
+                "loginConfig": {
+                    "appid": "716027609",
+                    "s_url": "https://graph.qq.com/oauth2.0/login_jump",
+                    "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+                    "login_sig": "",
+                    "ptui_version": "26030415",
+                    "lang": "2052",
+                    "style": "40",
+                    "pt_3rd_aid": "0",
+                    "daid": "",
+                    "target": "1",
+                },
             },
         )
 
@@ -492,6 +563,18 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
                         "data": {
                             "cookie": {"pt_login_sig": "sig-1", "ptdrvs": "token-1"},
                             "loginSig": "sig-1",
+                            "loginConfig": {
+                                "appid": "716027609",
+                                "s_url": "https://graph.qq.com/oauth2.0/login_jump",
+                                "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+                                "login_sig": "sig-1",
+                                "ptui_version": "26030415",
+                                "lang": "2052",
+                                "style": "40",
+                                "pt_3rd_aid": "0",
+                                "daid": "",
+                                "target": "1",
+                            },
                         },
                     }
                 ),
@@ -506,9 +589,90 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
             request_bytes.await_args.kwargs["cookies"],
             {"pt_login_sig": "sig-1", "ptdrvs": "token-1"},
         )
+        self.assertEqual(
+            request_bytes.await_args.kwargs["params"]["appid"],
+            "716027609",
+        )
+        self.assertEqual(
+            request_bytes.await_args.kwargs["params"]["pt_3rd_aid"],
+            "0",
+        )
+        self.assertNotIn("daid", request_bytes.await_args.kwargs["params"])
+        self.assertEqual(
+            request_bytes.await_args.kwargs["headers"]["Referer"],
+            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+        )
         self.assertEqual(result["data"]["loginSig"], "sig-1")
         self.assertEqual(result["data"]["cookie"]["pt_login_sig"], "sig-1")
         self.assertEqual(result["data"]["cookie"]["qrsig"], "alpha")
+        self.assertEqual(result["data"]["loginConfig"]["ptui_version"], "26030415")
+
+    async def test_get_login_status_uses_official_login_config(self):
+        api = GameAPI()
+        request_text = mock.AsyncMock(
+            return_value=(
+                {"status": 200, "headers": {}, "cookies": {}},
+                "ptuiCB('0','0','https://graph.qq.com/oauth2.0/login_jump?code=ok','0','登录成功','tester')",
+            )
+        )
+        request_redirect = mock.AsyncMock(
+            return_value=(
+                {"status": 200, "headers": {}, "cookies": {"p_skey": "cookie-final"}},
+                "",
+            )
+        )
+        login_config = {
+            "appid": "716027609",
+            "s_url": "https://graph.qq.com/oauth2.0/login_jump",
+            "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+            "login_sig": "sig-1",
+            "ptui_version": "26030415",
+            "lang": "2052",
+            "style": "40",
+            "pt_3rd_aid": "0",
+            "daid": "",
+            "target": "1",
+        }
+
+        with (
+            mock.patch.object(api, "_request_text", request_text),
+            mock.patch.object(api, "_request_get_with_allowed_redirects", request_redirect),
+        ):
+            result = await api.get_login_status(
+                {"qrsig": "alpha", "ptdrvs": "driver"},
+                "alpha",
+                123,
+                "sig-1",
+                login_config,
+            )
+
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(
+            request_text.await_args.kwargs["headers"]["Referer"],
+            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+        )
+        self.assertEqual(
+            request_text.await_args.kwargs["params"]["ptredirect"],
+            "1",
+        )
+        self.assertEqual(
+            request_text.await_args.kwargs["params"]["aid"],
+            "716027609",
+        )
+        self.assertEqual(
+            request_text.await_args.kwargs["params"]["pt_uistyle"],
+            "40",
+        )
+        self.assertEqual(
+            request_text.await_args.kwargs["params"]["js_ver"],
+            "26030415",
+        )
+        self.assertEqual(
+            request_text.await_args.kwargs["params"]["ptdrvs"],
+            "driver",
+        )
+        self.assertNotIn("daid", request_text.await_args.kwargs["params"])
+        self.assertNotIn("pt_3rd_aid", request_text.await_args.kwargs["params"])
 
     async def test_access_token_exchange_rejects_untrusted_redirect_host(self):
         api = GameAPI()
@@ -1560,6 +1724,9 @@ class MainRegressionTests(unittest.IsolatedAsyncioTestCase):
                     "qrSig": "sig",
                     "qrToken": 123,
                     "loginSig": "login-sig",
+                    "loginConfig": {
+                        "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609"
+                    },
                 },
             }
         )
@@ -1611,6 +1778,10 @@ class MainRegressionTests(unittest.IsolatedAsyncioTestCase):
             messages.append(result)
 
         self.assertEqual(command_api.get_login_status.await_count, 3)
+        self.assertEqual(
+            command_api.get_login_status.await_args_list[0].args[4],
+            {"href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609"},
+        )
         self.assertEqual(messages[1], "请打开手机QQ使用摄像头扫码，等待自动绑定。")
         self.assertIn("绑定成功", messages[-1])
 

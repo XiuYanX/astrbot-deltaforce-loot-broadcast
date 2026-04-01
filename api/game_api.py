@@ -18,6 +18,7 @@ APPID = 101491592
 BASE_URL = "https://comm.ams.game.qq.com/ide/"
 GAME_API_URL = "https://comm.aci.game.qq.com/main"
 LOGIN_APP_ID = 716027609
+QQ_LOGIN_S_URL = "https://graph.qq.com/oauth2.0/login_jump"
 QQ_QR_SHOW_URL = "https://xui.ptlogin2.qq.com/ssl/ptqrshow"
 QQ_LOGIN_TICKET_URL = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin"
 QQ_LOGIN_STATUS_URL = "https://ssl.ptlogin2.qq.com/ptqrlogin"
@@ -48,11 +49,24 @@ ALLOWED_REDIRECT_HOSTS = frozenset(
         "graph.qq.com",
         "milo.qq.com",
         "ptlogin2.graph.qq.com",
+        "ssl.ptlogin2.graph.qq.com",
         "ssl.ptlogin2.qq.com",
         "xui.ptlogin2.qq.com",
     }
 )
 ITEM_CATALOG_CACHE_TTL_SECONDS = 12 * 60 * 60
+DEFAULT_QQ_LOGIN_CONFIG = {
+    "appid": str(LOGIN_APP_ID),
+    "s_url": QQ_LOGIN_S_URL,
+    "href": "",
+    "login_sig": "",
+    "ptui_version": "",
+    "lang": "2052",
+    "style": "40",
+    "pt_3rd_aid": "0",
+    "daid": "",
+    "target": "1",
+}
 
 class GameAPI:
     def __init__(self, platform="qq", timeout=REQUEST_TIMEOUT):
@@ -114,6 +128,59 @@ class GameAPI:
         if not text or text.lower() in {"none", "null", "unknown"}:
             return ""
         return text
+
+    @staticmethod
+    def _decode_js_string_literal(value):
+        text = str(value or "")
+        if not text:
+            return ""
+        try:
+            return bytes(text, "utf-8").decode("unicode_escape")
+        except Exception:
+            return text
+
+    @classmethod
+    def _extract_qq_login_config_from_xlogin_page(cls, payload):
+        payload_text = str(payload or "")
+        config = dict(DEFAULT_QQ_LOGIN_CONFIG)
+        if not payload_text:
+            return config
+
+        pattern_map = {
+            "s_url": r's_url:"([^"]*)"',
+            "href": r'href:"([^"]*)"',
+            "login_sig": r'login_sig:"([^"]*)"',
+            "ptui_version": r'ptui_version:encodeURIComponent\("([^"]*)"\)',
+            "lang": r'lang:encodeURIComponent\("([^"]*)"\)',
+            "style": r'style:encodeURIComponent\("([^"]*)"\)',
+            "pt_3rd_aid": r'pt_3rd_aid:encodeURIComponent\("([^"]*)"\)',
+            "appid": r'appid:encodeURIComponent\("([^"]*)"\)',
+            "daid": r'daid:encodeURIComponent\("([^"]*)"\)',
+            "target": r'target:isNaN\(parseInt\("([^"]*)"\)\)',
+        }
+        for key, pattern in pattern_map.items():
+            match = re.search(pattern, payload_text)
+            if match:
+                config[key] = cls._decode_js_string_literal(match.group(1))
+
+        return config
+
+    @classmethod
+    def _normalize_qq_login_config(cls, config=None):
+        normalized = dict(DEFAULT_QQ_LOGIN_CONFIG)
+        if isinstance(config, dict):
+            for key in normalized:
+                value = cls._normalize_message_text(config.get(key))
+                if value:
+                    normalized[key] = value
+        return normalized
+
+    @classmethod
+    def _build_qq_login_headers(cls, login_config=None):
+        headers = cls._get_headers()
+        normalized = cls._normalize_qq_login_config(login_config)
+        headers["Referer"] = normalized.get("href") or QQ_LOGIN_TICKET_URL
+        return headers
 
     @classmethod
     def _extract_response_message(cls, payload):
@@ -258,6 +325,40 @@ class GameAPI:
                 pass
         return snapshot
 
+    @classmethod
+    def _decode_response_bytes(cls, response, body):
+        if body is None:
+            return ""
+        if isinstance(body, str):
+            return body
+        if not isinstance(body, (bytes, bytearray)):
+            return str(body)
+
+        candidate_encodings = []
+        charset = cls._normalize_message_text(getattr(response, "charset", ""))
+        if charset:
+            candidate_encodings.append(charset)
+
+        content_type = ""
+        headers = getattr(response, "headers", None)
+        if headers:
+            content_type = cls._normalize_message_text(headers.get("Content-Type", ""))
+        charset_match = re.search(r"charset=([\w-]+)", content_type, re.IGNORECASE)
+        if charset_match:
+            candidate_encodings.append(charset_match.group(1))
+
+        for encoding in ("utf-8", "utf-8-sig", "gb18030", "gbk", "big5", "latin1"):
+            if encoding not in candidate_encodings:
+                candidate_encodings.append(encoding)
+
+        for encoding in candidate_encodings:
+            try:
+                return bytes(body).decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                continue
+
+        return bytes(body).decode("utf-8", errors="replace")
+
     @staticmethod
     def _is_allowed_redirect_target(url):
         parsed = urlparse(str(url or ""))
@@ -315,7 +416,9 @@ class GameAPI:
         session = await self._get_session()
         try:
             async with session.request(method, url, **kwargs) as response:
-                return self._snapshot_response(response, session=session), await response.text()
+                body = await response.read()
+                decoded_text = self._decode_response_bytes(response, body)
+                return self._snapshot_response(response, session=session), decoded_text
         except REQUEST_EXCEPTIONS as exc:
             logger.warning(f"{error_context}: {type(exc).__name__}: {exc}")
             raise
@@ -494,20 +597,10 @@ class GameAPI:
     async def get_login_token(self):
         params = {
             "appid": LOGIN_APP_ID,
-            "daid": 383,
-            "style": 33,
-            "login_text": "登录",
-            "hide_title_bar": 1,
-            "hide_border": 1,
-            "target": "self",
-            "s_url": "https://graph.qq.com/oauth2.0/login_jump",
-            "pt_3rd_aid": APPID,
-            "pt_feedback_link": f"https://support.qq.com/products/77942?customInfo=milo.qq.com.appid{APPID}",
-            "theme": 2,
-            "verify_theme": "",
+            "s_url": QQ_LOGIN_S_URL,
         }
         try:
-            response, _ = await self._request_text(
+            response, result = await self._request_text(
                 "GET",
                 QQ_LOGIN_TICKET_URL,
                 params=params,
@@ -520,12 +613,18 @@ class GameAPI:
             return {"status": False, "message": "获取登录token失败", "data": {}}
 
         cookies = self._parse_cookies(response.get("cookies", {}))
+        login_config = self._extract_qq_login_config_from_xlogin_page(result)
+        login_sig = (
+            self._normalize_message_text(login_config.get("login_sig"))
+            or cookies.get("pt_login_sig", "")
+        )
         return {
             "status": True,
             "message": "获取成功",
             "data": {
                 "cookie": cookies,
-                "loginSig": cookies.get("pt_login_sig", ""),
+                "loginSig": login_sig,
+                "loginConfig": login_config,
             },
         }
 
@@ -545,24 +644,31 @@ class GameAPI:
                 "data": {},
             }
 
+        login_config = self._normalize_qq_login_config(
+            login_token.get("data", {}).get("loginConfig", {})
+        )
         params = {
-            "appid": LOGIN_APP_ID,
+            "appid": login_config.get("appid", str(LOGIN_APP_ID)),
             "e": 2,
             "l": "M",
             "s": 3,
             "d": 72,
             "v": 4,
-            "t": 0.6142752744667854,
-            "daid": 383,
-            "pt_3rd_aid": APPID,
-            "u1": "https://graph.qq.com/oauth2.0/login_jump",
+            "t": time.time(),
+            "u1": login_config.get("s_url", QQ_LOGIN_S_URL),
         }
+        daid = self._normalize_message_text(login_config.get("daid"))
+        if daid:
+            params["daid"] = daid
+        pt_3rd_aid = login_config.get("pt_3rd_aid")
+        if pt_3rd_aid not in (None, ""):
+            params["pt_3rd_aid"] = str(pt_3rd_aid)
         try:
             response, image_bytes = await self._request_bytes(
                 "GET",
                 QQ_QR_SHOW_URL,
                 params=params,
-                headers=self._get_headers(),
+                headers=self._build_qq_login_headers(login_config),
                 cookies=login_token.get("data", {}).get("cookie", {}),
                 error_context="Failed to get QQ login QR",
             )
@@ -593,42 +699,58 @@ class GameAPI:
                 "qrSig": qr_sig_value,
                 "qrToken": self._calc_qr_token(qr_sig_value),
                 "loginSig": login_sig_value,
+                "loginConfig": login_config,
             },
         }
 
-    async def get_login_status(self, cookie, qr_sig, qr_token, login_sig):
+    async def get_login_status(self, cookie, qr_sig, qr_token, login_sig, login_config=None):
         cookies = self._parse_cookies(cookie)
         if not cookies:
             return {"code": -1, "message": "缺少cookie参数", "data": {}}
 
+        normalized_login_config = self._normalize_qq_login_config(login_config)
+        login_sig_value = (
+            self._normalize_message_text(login_sig)
+            or normalized_login_config.get("login_sig")
+            or cookies.get("pt_login_sig", "")
+        )
         cookies["qrsig"] = str(qr_sig)
         params = {
-            "u1": "https://graph.qq.com/oauth2.0/login_jump",
+            "u1": normalized_login_config.get("s_url", QQ_LOGIN_S_URL),
             "ptqrtoken": qr_token,
-            "ptredirect": 0,
+            "ptredirect": normalized_login_config.get("target", "1"),
             "h": 1,
             "t": 1,
             "g": 1,
             "from_ui": 1,
-            "ptlang": 2052,
+            "ptlang": normalized_login_config.get("lang", "2052"),
             "action": f"0-0-{int(time.time() * 1000)}",
-            "js_ver": 25040111,
             "js_type": 1,
-            "login_sig": login_sig,
-            "pt_uistyle": 40,
-            "aid": LOGIN_APP_ID,
-            "daid": 383,
-            "pt_3rd_aid": APPID,
-            "o1vId": "378b06c889d9113b39e814ca627809e3",
-            "pt_js_version": "530c3f68",
+            "login_sig": login_sig_value,
+            "pt_uistyle": normalized_login_config.get("style", "40"),
+            "aid": normalized_login_config.get("appid", str(LOGIN_APP_ID)),
         }
+        js_ver = self._normalize_message_text(normalized_login_config.get("ptui_version"))
+        if js_ver:
+            params["js_ver"] = js_ver
+        daid = self._normalize_message_text(normalized_login_config.get("daid"))
+        if daid:
+            params["daid"] = daid
+        pt_3rd_aid = self._normalize_message_text(
+            normalized_login_config.get("pt_3rd_aid")
+        )
+        if pt_3rd_aid and pt_3rd_aid != "0":
+            params["pt_3rd_aid"] = pt_3rd_aid
+        ptdrvs = self._normalize_message_text(cookies.get("ptdrvs"))
+        if ptdrvs:
+            params["ptdrvs"] = ptdrvs
 
         try:
             response, result = await self._request_text(
                 "GET",
                 QQ_LOGIN_STATUS_URL,
                 params=params,
-                headers=self._get_headers(),
+                headers=self._build_qq_login_headers(normalized_login_config),
                 cookies=cookies,
                 error_context="Failed to get QQ login status",
             )
@@ -636,7 +758,11 @@ class GameAPI:
             logger.warning(
                 f"Failed to get QQ login status: {type(exc).__name__}: {exc}"
             )
-            return {"code": -4, "message": "获取登录状态失败", "data": {}}
+            return {
+                "code": -4,
+                "message": f"获取登录状态失败（网络异常：{type(exc).__name__}）",
+                "data": {},
+            }
 
         if response["status"] != 200:
             logger.warning(
@@ -652,7 +778,7 @@ class GameAPI:
             logger.warning(
                 f"Unexpected QQ login status payload: {result[:160]!r}"
             )
-            return {"code": -4, "message": "响应格式错误", "data": {}}
+            return {"code": -4, "message": "获取登录状态失败（响应格式错误）", "data": {}}
 
         code = matches.group(1)
         message = matches.group(5)
@@ -674,11 +800,11 @@ class GameAPI:
                 "Rejected unexpected QQ login redirect target while finalizing login status: "
                 f"{redirect_url}"
             )
-            return {"code": -4, "message": "获取登录状态失败", "data": {}}
+            return {"code": -4, "message": "获取登录状态失败（回跳地址异常）", "data": {}}
         try:
             redirect_response, _ = await self._request_get_with_allowed_redirects(
                 redirect_url,
-                headers=self._get_headers(),
+                headers=self._build_qq_login_headers(normalized_login_config),
                 cookies=merged_cookies,
                 error_context="Failed to finalize QQ login status",
             )
@@ -686,7 +812,11 @@ class GameAPI:
             logger.warning(
                 f"Failed to finalize QQ login status: {type(exc).__name__}: {exc}"
             )
-            return {"code": -4, "message": "获取登录状态失败", "data": {}}
+            return {
+                "code": -4,
+                "message": f"获取登录状态失败（登录回跳失败：{type(exc).__name__}）",
+                "data": {},
+            }
 
         all_cookies = self._merge_cookies(merged_cookies, redirect_response["cookies"])
         return {"code": 0, "message": "登录成功", "data": {"cookie": all_cookies}}

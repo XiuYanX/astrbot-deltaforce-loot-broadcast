@@ -186,11 +186,18 @@ class DeltaForceRedPlugin(Star):
         qr_sig = data.get("qrSig", "")
         qr_token = data.get("qrToken", "")
         login_sig = data.get("loginSig", "")
+        login_config = data.get("loginConfig", {})
         consecutive_status_failures = 0
         last_status_error = ""
 
         for _ in range(MAX_LOGIN_ATTEMPTS):
-            status_res = await self.command_api.get_login_status(cookie, qr_sig, qr_token, login_sig)
+            status_res = await self.command_api.get_login_status(
+                cookie,
+                qr_sig,
+                qr_token,
+                login_sig,
+                login_config,
+            )
             code = status_res.get("code")
             if code == 0:
                 consecutive_status_failures = 0

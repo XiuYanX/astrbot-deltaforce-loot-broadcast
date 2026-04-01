@@ -1,6 +1,6 @@
 name: astrbot_plugin_deltaforce_loot_broadcast
 display_name: AstrBot 三角洲物资播报
 desc: 监测玩家最近对局的撤离带出物品，并在命中高价值收集品时进行主动播报。
-version: 1.0.5
+version: 1.0.6
 author: XiuYan
 repo: https://github.com/XiuYanX/astrbot_plugin_deltaforce_loot_broadcast
