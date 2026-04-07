@@ -6,6 +6,15 @@
 
 - 暂无
 
+## v1.0.12 - 2026-04-07
+
+### 主要更新
+
+- 修复 QQ 换取令牌默认短链路仍使用旧表单参数的问题，默认分支现在会优先复用官方 `authorize_url` 中的 `scope`、`redirect_uri`、`state` 等参数，不再因为 `scope=` 空值而被 QQ 反复 302 打回 `oauth2.0/show`
+- 默认短链路的授权提交头和表单改为对齐 QQ 当前官方脚本，包括 `Referer: graph.qq.com/oauth2.0/show`、`Origin: https://graph.qq.com`、`from_ptlogin=1`、毫秒级 `auth_time` 与动态 `ui`
+- 保留完整 `oauth2.0/show` 链路作为非默认备用，但后续实测主线改为这条“短链路 + 官方参数对齐”的实现
+- 补充默认短链路和 `show` 失败后回退的回归测试，并在本地验证 `python tests/test_regressions.py` 共 67 项通过
+
 ## v1.0.11 - 2026-04-07
 
 ### 主要更新

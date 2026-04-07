@@ -27,7 +27,6 @@ QQ_LOGIN_S_URL = "https://graph.qq.com/oauth2.0/login_jump"
 QQ_QR_SHOW_URL = "https://xui.ptlogin2.qq.com/ssl/ptqrshow"
 QQ_LOGIN_TICKET_URL = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin"
 QQ_LOGIN_STATUS_URL = "https://ssl.ptlogin2.qq.com/ptqrlogin"
-QQ_LEGACY_AUTHORIZE_UI = "979D48F3-6CE2-4E95-A789-3BD3187648B6"
 QQ_AUTHORIZE_SHOW_FLOW_ENABLED = False
 WECHAT_QR_URL = "https://open.weixin.qq.com/connect/qrconnect"
 WECHAT_QR_STATUS_URL = "https://lp.open.weixin.qq.com/connect/l/qrconnect"
@@ -316,36 +315,74 @@ class GameAPI:
         )
 
     @classmethod
-    def _build_legacy_qq_authorize_headers(cls, login_config, cookies):
-        headers = cls._build_qq_login_headers(login_config)
-        headers["Referer"] = (
-            cls._normalize_message_text((login_config or {}).get("href"))
-            or "https://xui.ptlogin2.qq.com/"
+    def _get_qq_authorize_page_url(cls, login_config=None):
+        config = login_config or {}
+        authorize_url = cls._normalize_message_text(
+            config.get("authorize_url") or config.get("authorizeUrl")
         )
+        parsed_authorize_url = urlparse(authorize_url)
+        if (
+            authorize_url
+            and parsed_authorize_url.scheme == "https"
+            and (parsed_authorize_url.hostname or "").lower() == "graph.qq.com"
+            and parsed_authorize_url.path == "/oauth2.0/show"
+            and cls._is_allowed_redirect_target(authorize_url)
+        ):
+            return authorize_url
+        return f"{QQ_CONNECT_AUTHORIZE_URL}?{urlencode(cls._build_qq_connect_authorize_show_params())}"
+
+    @staticmethod
+    def _normalize_optional_bool(value):
+        if isinstance(value, str):
+            lowered_value = value.strip().lower()
+            if lowered_value in {"true", "1", "yes", "on"}:
+                return True
+            if lowered_value in {"false", "0", "no", "off"}:
+                return False
+            return None
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, bool):
+            return value
+        return None
+
+    @classmethod
+    def _build_legacy_qq_authorize_headers(cls, login_config, cookies):
+        headers = cls._get_headers()
+        headers["Referer"] = cls._get_qq_authorize_page_url(login_config)
+        headers["Origin"] = "https://graph.qq.com"
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         headers["X-G-TK"] = str(cls._get_gtk((cookies or {}).get("p_skey", "")))
-        headers.pop("Origin", None)
         return headers
 
     @classmethod
-    def _build_legacy_qq_authorize_form_data(cls, cookies):
+    def _build_legacy_qq_authorize_form_data(cls, cookies, login_config=None):
+        authorize_page_url = cls._get_qq_authorize_page_url(login_config)
+        authorize_query = parse_qs(urlparse(authorize_page_url).query, keep_blank_values=True)
+
+        def _query_value(name, default=""):
+            return cls._normalize_message_text((authorize_query.get(name) or [default])[0]) or default
+
+        authorize_need_login = cls._normalize_optional_bool(
+            (login_config or {}).get("authorize_need_login")
+        )
         return {
-            "response_type": "code",
-            "client_id": str(APPID),
-            "redirect_uri": (
-                f"{QQ_CONNECT_REDIRECT_URI}?parent_domain=https://df.qq.com"
-                "&isMiloSDK=1&isPc=1"
+            "response_type": _query_value("response_type", "code"),
+            "client_id": _query_value("client_id", str(APPID)),
+            "redirect_uri": _query_value(
+                "redirect_uri",
+                f"{QQ_CONNECT_REDIRECT_URI}?parent_domain=https://df.qq.com&isMiloSDK=1&isPc=1",
             ),
-            "scope": "",
-            "state": QQ_CONNECT_STATE,
-            "switch": "",
-            "form_plogin": 1,
-            "src": 1,
-            "update_auth": 1,
+            "scope": _query_value("scope", QQ_CONNECT_SCOPE),
+            "state": _query_value("state", QQ_CONNECT_STATE),
+            "switch": _query_value("switch", ""),
+            "from_ptlogin": 1,
+            "src": int(_query_value("src", "1") or 1),
+            "update_auth": 1 if authorize_need_login is not False else 0,
             "openapi": 1010,
             "g_tk": cls._get_gtk((cookies or {}).get("p_skey", "")),
-            "auth_time": int(time.time()),
-            "ui": QQ_LEGACY_AUTHORIZE_UI,
+            "auth_time": int(time.time() * 1000),
+            "ui": str(uuid.uuid4()).upper(),
         }
 
     async def _perform_qq_authorize_exchange(self, cookies, headers, form_data):
@@ -1112,7 +1149,10 @@ class GameAPI:
                 "the oauth2.0/show-based flow is disabled."
             )
             legacy_headers = self._build_legacy_qq_authorize_headers(raw_login_config, cookies)
-            legacy_form_data = self._build_legacy_qq_authorize_form_data(cookies)
+            legacy_form_data = self._build_legacy_qq_authorize_form_data(
+                cookies,
+                raw_login_config,
+            )
             exchange_result = await self._perform_qq_authorize_exchange(
                 cookies,
                 legacy_headers,
@@ -1291,7 +1331,10 @@ class GameAPI:
                 "falling back to legacy direct code exchange."
             )
             legacy_headers = self._build_legacy_qq_authorize_headers(raw_login_config, merged_cookies)
-            legacy_form_data = self._build_legacy_qq_authorize_form_data(merged_cookies)
+            legacy_form_data = self._build_legacy_qq_authorize_form_data(
+                merged_cookies,
+                raw_login_config,
+            )
             legacy_result = await self._perform_qq_authorize_exchange(
                 merged_cookies,
                 legacy_headers,

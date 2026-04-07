@@ -925,6 +925,11 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_access_token_exchange_uses_legacy_flow_by_default(self):
         api = GameAPI()
+        authorize_url = (
+            "https://graph.qq.com/oauth2.0/show?which=Login&display=pc&client_id=101491592"
+            "&src=1&state=STATE&response_type=code&scope=get_user_info&redirect_uri="
+            "https%3A%2F%2Fmilo.qq.com%2Fcomm-htdocs%2Flogin%2Fqc_redirect.html%3Fparent_domain%3Dhttps%3A%2F%2Fdf.qq.com%26isMiloSDK%3D1%26isPc%3D1"
+        )
         request_mock = mock.AsyncMock(
             side_effect=[
                 (
@@ -967,6 +972,8 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
                 {"p_skey": "token"},
                 {
                     "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+                    "authorize_url": authorize_url,
+                    "authorize_need_login": True,
                 },
             )
 
@@ -975,15 +982,18 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request_mock.await_count, 2)
         self.assertEqual(
             request_mock.await_args_list[0].kwargs["headers"]["Referer"],
-            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+            authorize_url,
         )
-        self.assertNotIn("Origin", request_mock.await_args_list[0].kwargs["headers"])
+        self.assertEqual(
+            request_mock.await_args_list[0].kwargs["headers"]["Origin"],
+            "https://graph.qq.com",
+        )
         self.assertEqual(
             request_mock.await_args_list[0].kwargs["data"]["scope"],
-            "",
+            "get_user_info",
         )
         self.assertEqual(
-            request_mock.await_args_list[0].kwargs["data"]["form_plogin"],
+            request_mock.await_args_list[0].kwargs["data"]["from_ptlogin"],
             1,
         )
         self.assertEqual(
@@ -1081,15 +1091,18 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request_mock.await_count, 3)
         self.assertEqual(
             request_mock.await_args_list[1].kwargs["headers"]["Referer"],
-            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+            authorize_url,
         )
-        self.assertNotIn("Origin", request_mock.await_args_list[1].kwargs["headers"])
+        self.assertEqual(
+            request_mock.await_args_list[1].kwargs["headers"]["Origin"],
+            "https://graph.qq.com",
+        )
         self.assertEqual(
             request_mock.await_args_list[1].kwargs["data"]["scope"],
-            "",
+            "get_user_info",
         )
         self.assertEqual(
-            request_mock.await_args_list[1].kwargs["data"]["form_plogin"],
+            request_mock.await_args_list[1].kwargs["data"]["from_ptlogin"],
             1,
         )
         self.assertEqual(
