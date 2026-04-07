@@ -3,6 +3,8 @@
 一个用于 AstrBot 的三角洲行动插件，用于监测玩家最近对局的撤离带出物品，并在命中高价值收集品时进行群播报。
 插件运行数据会优先写入 AstrBot 的 `data/plugin_data/astrbot_plugin_deltaforce_loot_broadcast/`，便于直接 `git pull` 后重载插件，而不必卸载重装。
 
+暂时有bug，等天才程序员GPT5.4修
+
 ## 版本信息
 
 - 当前版本：`v1.0.10`
