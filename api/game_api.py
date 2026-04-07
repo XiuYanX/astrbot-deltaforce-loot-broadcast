@@ -27,6 +27,8 @@ QQ_LOGIN_S_URL = "https://graph.qq.com/oauth2.0/login_jump"
 QQ_QR_SHOW_URL = "https://xui.ptlogin2.qq.com/ssl/ptqrshow"
 QQ_LOGIN_TICKET_URL = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin"
 QQ_LOGIN_STATUS_URL = "https://ssl.ptlogin2.qq.com/ptqrlogin"
+QQ_LEGACY_AUTHORIZE_UI = "979D48F3-6CE2-4E95-A789-3BD3187648B6"
+QQ_AUTHORIZE_SHOW_FLOW_ENABLED = False
 WECHAT_QR_URL = "https://open.weixin.qq.com/connect/qrconnect"
 WECHAT_QR_STATUS_URL = "https://lp.open.weixin.qq.com/connect/l/qrconnect"
 OBJECT_LIST_PARAMS = {
@@ -303,6 +305,109 @@ class GameAPI:
             return callback, payload_dict
         location = cls._normalize_message_text(response_snapshot.get("headers", {}).get("Location", ""))
         return location, payload_dict
+
+    @staticmethod
+    def _is_qq_authorize_show_url(url):
+        parsed = urlparse(str(url or ""))
+        return (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").lower() == "graph.qq.com"
+            and parsed.path == "/oauth2.0/show"
+        )
+
+    @classmethod
+    def _build_legacy_qq_authorize_headers(cls, login_config, cookies):
+        headers = cls._build_qq_login_headers(login_config)
+        headers["Referer"] = (
+            cls._normalize_message_text((login_config or {}).get("href"))
+            or "https://xui.ptlogin2.qq.com/"
+        )
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        headers["X-G-TK"] = str(cls._get_gtk((cookies or {}).get("p_skey", "")))
+        headers.pop("Origin", None)
+        return headers
+
+    @classmethod
+    def _build_legacy_qq_authorize_form_data(cls, cookies):
+        return {
+            "response_type": "code",
+            "client_id": str(APPID),
+            "redirect_uri": (
+                f"{QQ_CONNECT_REDIRECT_URI}?parent_domain=https://df.qq.com"
+                "&isMiloSDK=1&isPc=1"
+            ),
+            "scope": "",
+            "state": QQ_CONNECT_STATE,
+            "switch": "",
+            "form_plogin": 1,
+            "src": 1,
+            "update_auth": 1,
+            "openapi": 1010,
+            "g_tk": cls._get_gtk((cookies or {}).get("p_skey", "")),
+            "auth_time": int(time.time()),
+            "ui": QQ_LEGACY_AUTHORIZE_UI,
+        }
+
+    async def _perform_qq_authorize_exchange(self, cookies, headers, form_data):
+        try:
+            response, response_text = await self._request_text(
+                "POST",
+                QQ_CONNECT_AUTHORIZE_URL,
+                data=form_data,
+                headers=headers,
+                cookies=cookies,
+                allow_redirects=False,
+                error_context="Failed to start QQ access token exchange",
+            )
+        except REQUEST_EXCEPTIONS:
+            return {"status": False, "message": "获取access token失败", "data": {}}
+
+        location, payload_dict = self._extract_authorize_callback_url(response, response_text)
+        auth_code = self._extract_query_param(location, "code")
+        if "ret" in payload_dict and str(payload_dict.get("ret")) != "0":
+            message = self._extract_response_message(payload_dict) or "获取access token失败"
+            return {"status": False, "message": message, "data": {}}
+
+        merged_cookies = self._merge_cookies(cookies, response["cookies"])
+        if location and not self._is_allowed_redirect_target(location):
+            logger.warning(
+                "Rejected unexpected QQ authorize redirect target while exchanging access token: "
+                f"{location}"
+            )
+            return {"status": False, "message": "获取access token失败", "data": {}}
+
+        redirect_response = None
+        if location:
+            try:
+                redirect_response, _ = await self._request_get_with_allowed_redirects(
+                    location,
+                    headers=headers,
+                    cookies=merged_cookies,
+                    error_context="Failed to complete QQ authorize redirect",
+                )
+            except REQUEST_EXCEPTIONS:
+                return {"status": False, "message": "获取access token失败", "data": {}}
+            merged_cookies = self._merge_cookies(merged_cookies, redirect_response["cookies"])
+            auth_code = (
+                auth_code
+                or self._extract_query_param(redirect_response.get("url", ""), "code")
+                or self._extract_query_param(
+                    redirect_response.get("headers", {}).get("Location", ""),
+                    "code",
+                )
+            )
+
+        return {
+            "status": True,
+            "message": "获取成功",
+            "data": {
+                "auth_code": auth_code,
+                "location": location,
+                "response": response,
+                "redirect_response": redirect_response,
+                "cookies": merged_cookies,
+            },
+        }
 
     @classmethod
     def _extract_response_message(cls, payload):
@@ -984,6 +1089,97 @@ class GameAPI:
             return {"status": False, "message": "Cookie无效，请重新扫码登录", "data": {}}
 
         raw_login_config = login_config if isinstance(login_config, dict) else {}
+        enable_authorize_show_flow = raw_login_config.get("enable_authorize_show_flow")
+        if isinstance(enable_authorize_show_flow, str):
+            lowered_enable_authorize_show_flow = enable_authorize_show_flow.strip().lower()
+            if lowered_enable_authorize_show_flow in {"true", "1", "yes", "on"}:
+                enable_authorize_show_flow = True
+            elif lowered_enable_authorize_show_flow in {"false", "0", "no", "off"}:
+                enable_authorize_show_flow = False
+            else:
+                enable_authorize_show_flow = None
+        elif isinstance(enable_authorize_show_flow, (int, float)):
+            enable_authorize_show_flow = bool(enable_authorize_show_flow)
+        elif not isinstance(enable_authorize_show_flow, bool):
+            enable_authorize_show_flow = None
+
+        if enable_authorize_show_flow is None:
+            enable_authorize_show_flow = QQ_AUTHORIZE_SHOW_FLOW_ENABLED
+
+        if not enable_authorize_show_flow:
+            logger.info(
+                "Using legacy QQ authorize exchange flow by default; "
+                "the oauth2.0/show-based flow is disabled."
+            )
+            legacy_headers = self._build_legacy_qq_authorize_headers(raw_login_config, cookies)
+            legacy_form_data = self._build_legacy_qq_authorize_form_data(cookies)
+            exchange_result = await self._perform_qq_authorize_exchange(
+                cookies,
+                legacy_headers,
+                legacy_form_data,
+            )
+            if not exchange_result.get("status"):
+                return exchange_result
+            exchange_data = exchange_result.get("data", {})
+            auth_code = self._normalize_message_text(exchange_data.get("auth_code"))
+            merged_cookies = self._merge_cookies(cookies, exchange_data.get("cookies", {}))
+            location = self._normalize_message_text(exchange_data.get("location"))
+            response = exchange_data.get("response") or {}
+            redirect_response = exchange_data.get("redirect_response") or {}
+            final_url = self._normalize_message_text((redirect_response or {}).get("url"))
+            if not auth_code:
+                logger.warning(
+                    "QQ authorize exchange did not return an auth code. "
+                    f"status={response.get('status')} location={location!r} "
+                    f"final_url={final_url!r}"
+                )
+                return {"status": False, "message": "未获取到授权码，请重新扫码登录", "data": {}}
+
+            params = {
+                "a": "qcCodeToOpenId",
+                "qc_code": auth_code,
+                "appid": APPID,
+                "redirect_uri": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html",
+                "callback": "miloJsonpCb_86690",
+                "_": self._get_micro_time(),
+            }
+            try:
+                _, result = await self._request_text(
+                    "GET",
+                    "https://ams.game.qq.com/ams/userLoginSvr",
+                    params=params,
+                    headers={"referer": "https://df.qq.com/"},
+                    cookies=merged_cookies,
+                    error_context="Failed to exchange QQ code for access token",
+                )
+            except REQUEST_EXCEPTIONS:
+                return {"status": False, "message": "获取access token失败", "data": {}}
+
+            jsonp_match = re.search(r"try\{miloJsonpCb_86690\((\{.*?\})\);\}catch\(e\)\{\}", result)
+            if not jsonp_match:
+                jsonp_match = re.search(r"miloJsonpCb_86690\((\{.*?\})\)", result)
+            if not jsonp_match:
+                return {"status": False, "message": "AccessToken获取失败", "data": {}}
+
+            try:
+                json_data = json.loads(jsonp_match.group(1))
+            except json.JSONDecodeError as exc:
+                logger.warning(f"Failed to decode QQ access token response: {exc}")
+                return {"status": False, "message": "AccessToken获取失败", "data": {}}
+
+            if str(json_data.get("iRet")) != "0":
+                return {"status": False, "message": "AccessToken获取失败", "data": {}}
+
+            return {
+                "status": True,
+                "message": "获取成功",
+                "data": {
+                    "access_token": json_data.get("access_token", ""),
+                    "expires_in": json_data.get("expires_in", ""),
+                    "openid": json_data.get("openid", ""),
+                },
+            }
+
         authorize_page_url = self._normalize_message_text(
             raw_login_config.get("authorize_url") or raw_login_config.get("authorizeUrl")
         )
@@ -1064,58 +1260,61 @@ class GameAPI:
             "ui": str(uuid.uuid4()).upper(),
         }
 
-        try:
-            response, response_text = await self._request_text(
-                "POST",
-                "https://graph.qq.com/oauth2.0/authorize",
-                data=form_data,
-                headers=headers,
-                cookies=merged_cookies,
-                allow_redirects=False,
-                error_context="Failed to start QQ access token exchange",
-            )
-        except REQUEST_EXCEPTIONS:
-            return {"status": False, "message": "获取access token失败", "data": {}}
+        exchange_result = await self._perform_qq_authorize_exchange(
+            merged_cookies,
+            headers,
+            form_data,
+        )
+        if not exchange_result.get("status"):
+            return exchange_result
 
-        location, payload_dict = self._extract_authorize_callback_url(response, response_text)
-        auth_code = self._extract_query_param(location, "code")
-        if "ret" in payload_dict and str(payload_dict.get("ret")) != "0":
-            message = self._extract_response_message(payload_dict) or "获取access token失败"
-            return {"status": False, "message": message, "data": {}}
-        merged_cookies = self._merge_cookies(merged_cookies, response["cookies"])
-        if location and not self._is_allowed_redirect_target(location):
+        exchange_data = exchange_result.get("data", {})
+        auth_code = self._normalize_message_text(exchange_data.get("auth_code"))
+        merged_cookies = self._merge_cookies(
+            merged_cookies,
+            exchange_data.get("cookies", {}),
+        )
+        location = self._normalize_message_text(exchange_data.get("location"))
+        response = exchange_data.get("response") or {}
+        redirect_response = exchange_data.get("redirect_response") or {}
+
+        final_url = self._normalize_message_text((redirect_response or {}).get("url"))
+        if (
+            not auth_code
+            and (
+                self._is_qq_authorize_show_url(location)
+                or self._is_qq_authorize_show_url(final_url)
+            )
+        ):
             logger.warning(
-                "Rejected unexpected QQ authorize redirect target while exchanging access token: "
-                f"{location}"
+                "QQ authorize exchange bounced back to oauth2.0/show; "
+                "falling back to legacy direct code exchange."
             )
-            return {"status": False, "message": "获取access token失败", "data": {}}
-
-        redirect_response = None
-        if location:
-            try:
-                redirect_response, _ = await self._request_get_with_allowed_redirects(
-                    location,
-                    headers=headers,
-                    cookies=merged_cookies,
-                    error_context="Failed to complete QQ authorize redirect",
-                )
-            except REQUEST_EXCEPTIONS:
-                return {"status": False, "message": "获取access token失败", "data": {}}
-            merged_cookies = self._merge_cookies(merged_cookies, redirect_response["cookies"])
-            auth_code = (
-                auth_code
-                or self._extract_query_param(redirect_response.get("url", ""), "code")
-                or self._extract_query_param(
-                    redirect_response.get("headers", {}).get("Location", ""),
-                    "code",
-                )
+            legacy_headers = self._build_legacy_qq_authorize_headers(raw_login_config, merged_cookies)
+            legacy_form_data = self._build_legacy_qq_authorize_form_data(merged_cookies)
+            legacy_result = await self._perform_qq_authorize_exchange(
+                merged_cookies,
+                legacy_headers,
+                legacy_form_data,
             )
+            if not legacy_result.get("status"):
+                return legacy_result
+            legacy_data = legacy_result.get("data", {})
+            auth_code = self._normalize_message_text(legacy_data.get("auth_code"))
+            merged_cookies = self._merge_cookies(
+                merged_cookies,
+                legacy_data.get("cookies", {}),
+            )
+            location = self._normalize_message_text(legacy_data.get("location"))
+            response = legacy_data.get("response") or {}
+            redirect_response = legacy_data.get("redirect_response") or {}
+            final_url = self._normalize_message_text((redirect_response or {}).get("url"))
 
         if not auth_code:
             logger.warning(
                 "QQ authorize exchange did not return an auth code. "
                 f"status={response.get('status')} location={location!r} "
-                f"final_url={(redirect_response or {}).get('url', '')!r}"
+                f"final_url={final_url!r}"
             )
             return {"status": False, "message": "未获取到授权码，请重新扫码登录", "data": {}}
 
