@@ -16,7 +16,12 @@ MAX_LOGIN_ATTEMPTS = 120
 LOGIN_ATTEMPT_INTERVAL = 0.5
 MAX_TRANSIENT_LOGIN_STATUS_FAILURES = 12
 
-@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.5")
+@register(
+    "astrbot_plugin_deltaforce_loot_broadcast",
+    "XiuYan",
+    "AstrBot 三角洲物资播报插件（测试版，QQ 绑定链路仍在验证）",
+    "1.0.14",
+)
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
