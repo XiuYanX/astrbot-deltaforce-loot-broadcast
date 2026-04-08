@@ -257,6 +257,8 @@ class DeltaForceRedPlugin(Star):
         """异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
         logger.info("AstrBot 三角洲物资播报插件初始化...")
         logger.info(f"AstrBot 三角洲物资播报运行数据目录: {get_runtime_data_dir()}")
+        # AstrBot may re-enter initialize during hot reload or recovery. Keep a
+        # single polling task so we do not duplicate requests and broadcasts.
         if self.polling_task and not self.polling_task.done():
             logger.warning("Polling task is already running; skipping duplicate initialization.")
             return
@@ -272,6 +274,8 @@ class DeltaForceRedPlugin(Star):
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                # Keep the long-running background task alive at the boundary.
+                # Detailed failure context goes to logs; the next loop can retry.
                 logger.error(f"轮询任务异常: {type(e).__name__}: {e}")
                 await asyncio.sleep(60)
 

@@ -8,3 +8,4 @@ debug_last_report.txt
 debug_last_broadcast.txt
 tests/.tmp/
 旧版本/
+.tmp_*.html

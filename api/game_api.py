@@ -97,8 +97,11 @@ class GameAPI:
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession(
                     timeout=self.timeout,
-                    # Requests pass cookies explicitly so multiple bound accounts
-                    # do not share implicit session state through one CookieJar.
+                    # Regular game-data requests pass cookies explicitly so multiple
+                    # bound accounts do not share implicit session state through
+                    # one CookieJar. The QQ bind flow uses its own short-lived
+                    # sessions below because that browser-like login chain needs
+                    # an isolated cookie jar per bind attempt.
                     cookie_jar=self._create_cookie_jar(),
                 )
             return self._session
@@ -725,6 +728,10 @@ class GameAPI:
 
     async def _get_login_token_classic(self):
         params = self._build_classic_qq_login_token_params()
+        # The classic QQ QR login flow is intentionally kept on dedicated
+        # short-lived sessions. Each bind attempt must carry its own transient
+        # ptlogin/graph cookie state without leaking it into the shared API
+        # session used by normal gameplay queries.
         session = aiohttp.ClientSession(timeout=self.timeout)
         try:
             response, result = await self._request_text(

@@ -10,6 +10,9 @@ LEGACY_PLUGIN_NAMES = (
 )
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 LEGACY_LOCAL_RUNTIME_DIR = PLUGIN_ROOT / ".runtime_data"
+# StarTools remains the primary source of truth. This fallback only keeps local
+# tests, partial framework startup, and legacy migrations operable when the
+# framework helper is temporarily unavailable.
 FALLBACK_RUNTIME_DIR = (Path.cwd() / "data" / "plugin_data" / PLUGIN_NAME).resolve()
 _FRAMEWORK_RUNTIME_DIR = None
 _FRAMEWORK_RUNTIME_DIR_FAILURE_LOGGED = False
@@ -25,6 +28,8 @@ def _normalize_runtime_relative_path(value, *, label):
     relative_path = Path(str(value or ""))
     if not relative_path.parts:
         raise ValueError(f"{label} must not be empty")
+    # Runtime files are always resolved relative to the plugin data dir so
+    # helper callers cannot accidentally escape into arbitrary paths.
     if relative_path.is_absolute():
         raise ValueError(f"{label} must be a relative path")
     if any(part in ("", ".", "..") for part in relative_path.parts):
